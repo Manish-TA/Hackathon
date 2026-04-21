@@ -1,18 +1,17 @@
 import os
 import json
-import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-from models import Action
 from env import DevOpsEnv
+from models import Action, Reward
+from multi_agent import WarRoom, AGENT_NAMES, IC_NAME
 
 load_dotenv()
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-ENV_URL = os.getenv("ENV_URL", "https://nithishgouds-opssim-ai.hf.space")
 MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
-MAX_STEPS = 8
+MAX_STEPS = 15
 LLM_SEED = 42
 
 if HF_TOKEN is None:
@@ -20,439 +19,200 @@ if HF_TOKEN is None:
 
 client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
-class APIClient:
-    def __init__(self, base_url):
-        self.base_url = base_url
-        self.state_data = {}
-        self.last_action_error = None
-        self.local_env = DevOpsEnv(seed=42)
-        self.use_local_env = False
 
-    def reset(self, task):
-        self.last_action_error = None
-
-        if self.use_local_env:
-            obs = self.local_env.reset(task=task)
-            self.state_data = self.local_env.get_state().get("state", {})
-            self.last_action_error = self.local_env.last_action_error
-            return self._to_dotdict(obs.model_dump())
-
-        payload = {"task": task, "seed": 42}
-        try:
-            resp = requests.post(f"{self.base_url}/reset", json=payload, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            self._sync_state()
-            return self._to_dotdict(data.get("observation", {}))
-        except requests.RequestException:
-            self.use_local_env = True
-            obs = self.local_env.reset(task=task)
-            self.state_data = self.local_env.get_state().get("state", {})
-            self.last_action_error = self.local_env.last_action_error
-            return self._to_dotdict(obs.model_dump())
-
-    def step(self, action):
-        if self.use_local_env:
-            obs, reward, done, info = self.local_env.step(action)
-            self.state_data = self.local_env.get_state().get("state", {})
-            self.last_action_error = self.local_env.last_action_error
-            reward_value = reward.value if hasattr(reward, "value") else reward
-            return self._to_dotdict(obs.model_dump()), reward_value, done, info
-
-        payload = {"action_type": action.action_type}
-        if hasattr(action, "target") and action.target:
-            payload["target"] = action.target
-
-        try:
-            resp = requests.post(f"{self.base_url}/step", json=payload, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            obs = self._to_dotdict(data.get("observation", {}))
-            self.last_action_error = data.get("last_action_error", None)
-            self._sync_state()
-            return obs, data.get("reward", 0.0), data.get("done", False), data.get("info", {})
-        except requests.RequestException:
-            self.use_local_env = True
-            obs, reward, done, info = self.local_env.step(action)
-            self.state_data = self.local_env.get_state().get("state", {})
-            self.last_action_error = self.local_env.last_action_error
-            reward_value = reward.value if hasattr(reward, "value") else reward
-            return self._to_dotdict(obs.model_dump()), reward_value, done, info
-
-    def _sync_state(self):
-        if self.use_local_env:
-            self.state_data = self.local_env.get_state().get("state", {})
-            return
-        try:
-            resp = requests.get(f"{self.base_url}/state", timeout=10)
-            if resp.status_code == 200:
-                self.state_data = resp.json().get("state", {}).get("state", {})
-        except requests.RequestException:
-            pass
-
-    def _to_dotdict(self, d):
-        class DotDict(dict):
-            def __getattr__(self, attr):
-                return self.get(attr)
-        return DotDict(d)
-
-    def close(self):
-        if self.use_local_env:
-            self.local_env.close()
+def call_llm(prompt, max_tokens=150):
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=max_tokens,
+            seed=LLM_SEED,
+        )
+        return response.choices[0].message.content or ""
+    except Exception:
+        return ""
 
 
-class LLMParser:
-    def __init__(self):
-        self.client = client
-        self.model = MODEL_NAME
-        self.cache = {}
+def build_domain_agent_prompt(agent_name, domain_obs, incident_channel):
+    channel_text = ""
+    if incident_channel:
+        channel_text = "\n".join(
+            f"  [{m['from']}]: {m['message']}" for m in incident_channel
+        )
+    else:
+        channel_text = "  (empty)"
 
-    def parse(self, observation, action_history):
-        key = self._build_cache_key(observation, action_history)
-        if key in self.cache:
-            return self.cache[key]
+    domain_state_text = json.dumps(domain_obs.domain_state, indent=2, default=str) if domain_obs.domain_state else "No data visible in your domain."
 
-        if observation.task_type == "easy":
-            result = self._parse_easy(observation)
-        elif observation.task_type == "medium":
-            result = self._parse_medium(observation)
-        else:
-            result = self._parse_hard(observation, action_history)
+    return f"""DO NOT output anything except valid JSON.
 
-        if result[1] >= 0.7:
-             self.cache[key] = result
-        return result
+You are {agent_name}, a domain specialist in an incident war room.
+Your role: OBSERVE your domain and REPORT findings to the Incident Commander.
+You can ONLY see your own domain's data. Other domains are invisible to you.
 
-    def _parse_easy(self, obs):
-        prompt = self._build_easy_prompt(obs)
-        response = self._call_llm(prompt)
-        return self._parse_easy_response(response, obs)
+Your Domain State:
+{domain_state_text}
 
-    def _build_easy_prompt(self, obs) -> str:
-        return f"""
-DO NOT output anything except valid JSON.
+Recent Logs:
+{domain_obs.logs or "None"}
 
-You are an automated DevOps recovery agent. Your objective is to resolve a system alert by executing a single configuration fix.
+Incident Channel (shared communication):
+{channel_text}
 
-1. Analyze the panicked user message and the specific error logs.
-2. Review the current config state.
-3. Identify and execute the single correct configuration action that resolves the root cause.
-4. BEWARE of "red herring" actions: The user might blame the wrong system (e.g., UI changes) when the logs indicate a deeper infrastructure failure.
+Your Available Actions (for reference — you do NOT execute, only observe and report):
+{json.dumps(domain_obs.available_actions)}
 
-User Message: "{obs.user_message}"
-Logs: {obs.logs}
-
-Current Config State:
-{json.dumps(obs.config, indent=2)}
-
-Available Actions:
-{json.dumps(obs.available_actions)}
+Instructions:
+- Analyze your domain state for anomalies, failures, or degradation.
+- Report what you see and what you recommend to the Incident Commander.
+- Be specific about which metrics are abnormal and why.
+- If you have no useful data, say so.
 
 Return ONLY JSON:
 {{
-  "action": "<exact_string_from_available_actions>"
-}}
-"""
+  "observation": "<what you see in your domain>",
+  "recommendation": "<what action you recommend, if any>",
+  "severity": "critical|warning|normal"
+}}"""
 
-    def _parse_easy_response(self, text, obs):
-        try:
-            data = json.loads(text)
-            action = data.get("action", "")
-            if action in obs.available_actions:
-                return action, 1.0, None
-            else:
-                return "do_nothing", 0.0, None
-        except Exception:
-            return "do_nothing", 0.0, None
 
-    def _parse_medium(self, obs):
-        prompt = self._build_medium_prompt(obs)
-        response = self._call_llm(prompt)
-        return self._parse_medium_response(response, obs)
+def build_ic_prompt(incident_channel, available_actions, playbook_text, action_history, step_count):
+    channel_text = "\n".join(
+        f"  [{m['from']}]: {m['message']}" for m in incident_channel
+    ) if incident_channel else "  (empty)"
 
-    def _build_medium_prompt(self, obs):
-        return f"""
-DO NOT output anything except valid JSON.
+    history_text = "\n".join(
+        f"  {i+1}. [{h['target']}] {h['action']} -> reward={h['reward']:.3f}"
+        for i, h in enumerate(action_history)
+    ) if action_history else "  None"
 
-You are an AI agent diagnosing a production issue in a dynamic environment.
+    action_domain_hint = ""
+    for a in available_actions:
+        action_domain_hint += f"  - {a}\n"
 
-- **Logs (Snapshot):** The Logs section now only shows the result of your **very last action**. Use the [IMPACT] and [HINT] provided to understand how the system state changed.
-- **User Complaints:** These are your primary signal for overall system health. If complaints remain "unchanged" or "bad," your last action likely didn't address the root cause.
-- **Decision Making:** Since you only see the most recent result, maintain an internal logic of your progress. Avoid repeating actions that previously yielded "No meaningful change" or "Analysis already complete."
+    return f"""DO NOT output anything except valid JSON.
 
-User complaints:
-{obs.user_messages}
-
-Last Action Result:
-{obs.logs}
-
-Available actions:
-{obs.available_actions}
-
-Return ONLY JSON:
-{{
-  "action": "<one action>",
-  "confidence": 0.9
-}}
-"""
-
-    def _parse_medium_response(self, text, obs):
-        try:
-            data = json.loads(text)
-            action = data.get("action", "do_nothing")
-            confidence = float(data.get("confidence", 0.3))
-            confidence = max(0.0, min(1.0, confidence))
-            return action, confidence, None
-        except Exception:
-            return "do_nothing", 0.3, None
-
-    def _parse_hard(self, obs, action_history):
-        prompt = self._build_hard_prompt(obs, action_history)
-        response = self._call_llm(prompt)
-        return self._parse_hard_response(response, obs)
-
-    def _build_hard_prompt(self, obs, action_history):
-        history_str = "\n".join([f"{i+1}. {act}" for i, act in enumerate(action_history)]) if action_history else "None"
-        
-        return f"""
-DO NOT output anything except valid JSON.
-
-You are managing a catastrophic system failure. You must follow the SLA Playbook rules exactly.
-
-IMPORTANT RULES:
-- Do NOT repeat actions that resulted in negative reward.
-- Avoid "do_nothing" unless absolutely necessary.
-- If an action caused no improvement, try a different strategy.
-- Always aim to reduce system failure quickly.
-- Choose ONLY from Available Actions.
-- Do NOT hallucinate new actions.
-- If an action caused negative reward, avoid it
-
-Goal:
-- Minimize total penalty
-- Follow SLA rules strictly
-- Stabilize system as fast as possible
+You are the Incident Commander (IC) in a DevOps war room.
+You coordinate 3 domain agents: AppOps, InfraOps, DatabaseOps.
+You do NOT investigate directly. You read their reports and issue directives.
 
 Playbook:
-{obs.playbook_text}
+{playbook_text or "No playbook available."}
 
-System State:
-{json.dumps(obs.system_state, indent=2)}
-
-Logs (Previous Steps Details):
-{obs.logs}
+Incident Channel (all agent reports and past directives):
+{channel_text}
 
 Previous Actions Taken:
-{history_str}
+{history_text}
 
 Available Actions:
-{json.dumps(obs.available_actions)}
+{action_domain_hint}
 
-Step Count: {obs.step_count}
+Step: {step_count} / {MAX_STEPS}
+
+Rules:
+- Issue ONE directive: choose which agent should execute which action.
+- Do NOT repeat actions that had negative rewards.
+- Prioritize critical findings reported by domain agents.
+- Follow the playbook strictly.
+- If insufficient information, direct an investigation action.
 
 Return ONLY JSON:
 {{
-    "action": "<exact_string_from_available_actions>",
-    "target": null,
-    "confidence": 0.0-1.0
-}}
-"""
-
-    def _parse_hard_response(self, text, obs):
-        try:
-            data = json.loads(text)
-            action = data.get("action", "")
-            target = data.get("target", None)
-            confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
-            
-            if not action:
-                 return sorted(obs.available_actions)[0], 0.0, None
-            
-            return action, confidence, target
-        except Exception:
-            return sorted(obs.available_actions)[0], 0.0, None
-
-    def _call_llm(self, prompt):
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                top_p=1.0,
-                max_tokens=150,
-                seed=LLM_SEED
-            )
-            return response.choices[0].message.content or ""
-        except Exception:
-            return ""
-
-    def _build_cache_key(self, obs, action_history):
-        if obs.task_type == "hard":
-            return json.dumps({
-                "state": obs.system_state,
-                "step": obs.step_count,
-                "actions": obs.available_actions,
-                "history": action_history
-            }, sort_keys=True)
-        else:
-            return json.dumps({
-                "task": obs.task_type,
-                "messages": getattr(obs, "user_messages", None),
-                "logs": getattr(obs, "logs", ""),
-                "metrics": getattr(obs, "system_metrics", None),
-                "state": getattr(obs, "system_state", None)
-            }, sort_keys=True)
-        
-def _calculate_easy_bounds(env: APIClient, max_steps: int) -> tuple[float, float]: # CHANGED: Updated type hint to APIClient
-    base_step_cost = -0.05
-    correct_reward = 1.0 + base_step_cost
-    new_herring_reward = 0.2 + base_step_cost
-    repeat_herring_penalty = -0.4 + base_step_cost
-    invalid_action_penalty = -0.2 + base_step_cost
-
-    red_herrings_count = len(env.state_data.get("red_herrings", {}))
-
-    usable_herrings = min(red_herrings_count, max_steps - 1)
-    max_reward = (usable_herrings * new_herring_reward) + correct_reward
-
-    worst_invalid_spam = max_steps * invalid_action_penalty
-    
-    if red_herrings_count > 0:
-        worst_herring_spam = new_herring_reward + ((max_steps - 1) * repeat_herring_penalty)
-    else:
-        worst_herring_spam = float('inf')
-
-    min_reward = min(worst_herring_spam, worst_invalid_spam)
-
-    return min_reward, max_reward
+  "target_agent": "AppOps|InfraOps|DatabaseOps",
+  "action": "<exact_action_from_available_actions>",
+  "reasoning": "<brief explanation>"
+}}"""
 
 
-def _calculate_medium_bounds(env: APIClient, max_steps: int) -> tuple[float, float]: # CHANGED: Updated type hint to APIClient
-    invalid_pen = env.state_data.get("invalid_action_penalty", -0.2)
-    repeat_pen = env.state_data.get("repeat_penalty", -0.15)
-    step_pen = env.state_data.get("step_penalty", -0.03)
-    rules = env.state_data.get("transition_rules", {})
+def parse_domain_response(text):
+    try:
+        data = json.loads(text)
+        return {
+            "observation": data.get("observation", ""),
+            "recommendation": data.get("recommendation", ""),
+            "severity": data.get("severity", "normal"),
+        }
+    except Exception:
+        return {"observation": text[:200], "recommendation": "", "severity": "normal"}
 
-    min_reward = 0.0
-    for step in range(1, max_steps + 1):
-        repeat_count = step - 1 
-        step_worst = invalid_pen + (repeat_pen * repeat_count) + (step_pen * step)
-        min_reward += step_worst
 
-    max_rule_reward = 0.0
-    for rule in rules.values():
-        r1 = float(rule.get("reward", 0.0))
-        r2 = float(rule.get("else_reward", 0.0))
-        max_rule_reward = max(max_rule_reward, r1, r2)
-    
-    max_reward = 0.0
-    for step in range(1, max_steps + 1):
-        max_reward += max_rule_reward + (step_pen * step)
+def parse_ic_response(text, available_actions):
+    try:
+        data = json.loads(text)
+        target = data.get("target_agent", "AppOps")
+        action = data.get("action", "do_nothing")
+        if target not in AGENT_NAMES:
+            target = "AppOps"
+        if action not in available_actions and action != "do_nothing":
+            action = "do_nothing"
+        return {"target_agent": target, "action": action}
+    except Exception:
+        return {"target_agent": "AppOps", "action": "do_nothing"}
 
-    max_reward = max(max_reward, 0.999)
 
-    return min_reward, max_reward
-        
-def grade_easy(num_scenarios=1):
-    total_score = 0.0
-    
-    env = APIClient(base_url=ENV_URL) # CHANGED: Initialized APIClient instead of local class
-    parser = LLMParser()
-    
-    for i in range(num_scenarios):
-        total_reward = 0.0
-        done = False
-        rewards_list = []
-        action_history = []
-        start_printed = False
-        min_reward = -1.0
-        max_reward = 0.99
-        try:
-            obs = env.reset(task = "easy")
-            min_reward, max_reward = _calculate_easy_bounds(env, MAX_STEPS)
-            print(f"[START] task=easy_scenario_{i+1} env=opssim_ai model={MODEL_NAME}")
-            start_printed = True
-            
-            for step in range(MAX_STEPS):
-                action_str, _, target = parser.parse(obs, action_history)
-                
-                obs, reward, done, info = env.step(Action(action_type=action_str, target=target))
-                
-                log_action = f"{action_str}({target})" if target else action_str
-                action_history.append(log_action)
-                
-                total_reward += reward
-                rewards_list.append(f"{reward:.2f}")
-                error_msg = env.last_action_error if env.last_action_error is not None else "null"
+def run_episode(scenario_idx=None):
+    room = WarRoom(seed=LLM_SEED, max_steps=MAX_STEPS)
+    obs, domain_observations = room.reset()
 
-                print(f"[STEP] step={step+1} action={action_str} reward={reward:.2f} done={str(done).lower()} error={error_msg}")
-                
-                if done:
-                    break
-        finally:
-            env.close()
-            scenario_score = max(0.01, min(0.99, (total_reward - min_reward) / ((max_reward - min_reward) + 0.001)))
-            
-            scenario_score = 0.001 + (scenario_score * 0.998)
-            if start_printed:
-                success = "true" if (done and total_reward > 0) else "false"
-                rewards_str = ",".join(rewards_list)
-                print(f"[END] success={success} steps={len(rewards_list)} score={scenario_score:.4f} rewards={rewards_str}")
+    available_actions = obs.available_actions or []
+    playbook_text = obs.playbook_text or ""
 
-        total_score += scenario_score
+    print(f"[START] scenario={room.env.state_data.get('scenario_id', 'unknown')} model={MODEL_NAME}")
 
-    return total_score / num_scenarios
+    for step in range(MAX_STEPS):
+        if room.is_done():
+            break
 
-def grade_medium(num_scenarios = 1):
-    total_score = 0.0
-    
-    env = APIClient(base_url=ENV_URL) # CHANGED: Initialized APIClient instead of local class
-    parser = LLMParser()
-    
-    for i in range(num_scenarios):
-        total_reward = 0.0
-        done = False
-        rewards_list = []
-        action_history = []
-        start_printed = False
-        min_reward = -1.0
-        max_reward = 0.99
-        try:
-            obs = env.reset(task = "medium")
-            min_reward, max_reward = _calculate_medium_bounds(env, MAX_STEPS)
-            print(f"[START] task=medium_scenario_{i+1} env=opssim_ai model={MODEL_NAME}")
-            start_printed = True
-            
-            for step in range(MAX_STEPS):
-                action_str, _, target = parser.parse(obs, action_history)
-                
-                obs, reward, done, info = env.step(Action(action_type=action_str, target=target))
-                
-                log_action = f"{action_str}({target})" if target else action_str
-                action_history.append(log_action)
-                
-                total_reward += reward
-                rewards_list.append(f"{reward:.2f}")
-                error_msg = env.last_action_error if env.last_action_error is not None else "null"
+        agent_messages = {}
+        for agent_name in AGENT_NAMES:
+            domain_obs = domain_observations.get(agent_name)
+            if domain_obs is None:
+                domain_obs = room.env.get_domain_observation(agent_name)
+            prompt = build_domain_agent_prompt(agent_name, domain_obs, room.get_incident_channel())
+            response_text = call_llm(prompt, max_tokens=200)
+            parsed = parse_domain_response(response_text)
+            message = f"[{parsed['severity'].upper()}] {parsed['observation']}"
+            if parsed["recommendation"]:
+                message += f" | Recommend: {parsed['recommendation']}"
+            agent_messages[agent_name] = message
 
-                print(f"[STEP] step={step+1} action={action_str} reward={reward:.2f} done={str(done).lower()} error={error_msg}")
-                
-                if done:
-                    break
-        finally:
-            env.close()
-            scenario_score = max(0.01, min(0.99, (total_reward - min_reward) / ((max_reward - min_reward) + 0.001)))
-            scenario_score = 0.001 + (scenario_score * 0.998)
-            if start_printed:
-                success = "true" if (done and total_reward > 0) else "false"
-                rewards_str = ",".join(rewards_list)
-                print(f"[END] success={success} steps={len(rewards_list)} score={scenario_score:.4f} rewards={rewards_str}")
+        ic_prompt = build_ic_prompt(
+            room.get_incident_channel(),
+            available_actions,
+            playbook_text,
+            room.action_history,
+            step + 1,
+        )
+        ic_text = call_llm(ic_prompt, max_tokens=200)
+        directive = parse_ic_response(ic_text, available_actions)
 
-        total_score += scenario_score
+        result = room.run_step(agent_messages, directive)
 
-    return total_score / num_scenarios
+        reward_val = result["reward"].value
+        done = result["done"]
 
-def _calculate_dynamic_min_reward(env: APIClient, max_steps: int) -> float: # CHANGED: Updated type hint to APIClient
+        error_msg = room.env.last_action_error if room.env.last_action_error else "null"
+        print(
+            f"[STEP] step={step+1} target={directive['target_agent']} "
+            f"action={directive['action']} reward={reward_val:.2f} "
+            f"done={str(done).lower()} error={error_msg}"
+        )
+
+        if done:
+            break
+
+        domain_observations = result.get("domain_observations", {})
+
+    total = room.get_total_reward()
+    success = "true" if (room.is_done() and total > 0) else "false"
+    print(f"[END] success={success} steps={room.step_count} total_reward={total:.2f}")
+    return total, room
+
+
+def _calculate_dynamic_min_reward(env, max_steps):
     worst_bleed = 0.0
     for rule in env.state_data.get("bleed_rules", []):
         penalty = rule.get("penalty", 0.0)
@@ -460,72 +220,85 @@ def _calculate_dynamic_min_reward(env: APIClient, max_steps: int) -> float: # CH
             worst_bleed += penalty
     worst_penalty = min(env.state_data.get("penalties", {}).values(), default=0)
     worst_urgency_total = -0.05 * (max_steps * (max_steps + 1) / 2)
-    worst_urgency_penalty_per_step = worst_urgency_total / max_steps
-    worst_case_per_step = worst_bleed + worst_penalty + worst_urgency_penalty_per_step
-    sla_violation_penalty = env.state_data.get("sla_violation_penalty", -1.0)
-    min_reward = (max_steps * worst_case_per_step) + sla_violation_penalty
-    return min_reward
+    worst_urgency_per_step = worst_urgency_total / max_steps
+    worst_per_step = worst_bleed + worst_penalty + worst_urgency_per_step
+    sla_penalty = env.state_data.get("sla_violation_penalty", -1.0)
+    comm_cost = -0.02 * max_steps * 3
+    return (max_steps * worst_per_step) + sla_penalty + comm_cost
 
-def grade_hard(num_scenarios=1):
+
+def grade(num_scenarios=1):
     total_score = 0.0
-    
-    env = APIClient(base_url=ENV_URL) # CHANGED: Initialized APIClient instead of local class
-    parser = LLMParser()
-    
-    for i in range(num_scenarios):
-        total_reward = 0.0
-        done = False
-        action_history = []
-        rewards_list = []
-        start_printed = False
-        min_reward = 0.01
-        max_reward = 0.99
-        last_info = {}
-        try:
-            obs = env.reset(task = "hard")
-            min_reward = _calculate_dynamic_min_reward(env, MAX_STEPS)
-            max_success = 1.0 * MAX_STEPS
-            max_progress = 0.3 * MAX_STEPS
-            max_reward = max_success + max_progress
-            
-            print(f"[START] task=hard_scenario_{i+1} env=opssim_ai model={MODEL_NAME}")
-            start_printed = True
-            
-            for step in range(MAX_STEPS):
-                action_str, confidence, target = parser.parse(obs, action_history)
-                log_action = f"{action_str}({target})" if target else action_str
-                
-                action = Action(action_type=action_str, target=target)
-                
-                obs, reward, done, info = env.step(action)
-                last_info = info
-                total_reward += reward
-                rewards_list.append(f"{reward:.2f}")
-                action_history.append(log_action)
-                error_msg = env.last_action_error if env.last_action_error is not None else "null"
-                
-                print(f"[STEP] step={step+1} action={log_action} reward={reward:.2f} done={str(done).lower()} error={error_msg}")
-                
-                if done:
-                    break
-        finally:
-            env.close()
-            final_score = (total_reward - min_reward) / ((max_reward - min_reward)+0.001)
-            final_score = max(0.01, min(0.99, final_score))
-            final_score = 0.001 + (final_score * 0.998)
-            if start_printed:
-                success = "true" if (done and last_info.get("reason") not in {"guardrail_violation", "sla_violation"}) else "false"
-                rewards_str = ",".join(rewards_list)
-                print(f"[END] success={success} steps={len(rewards_list)} score={final_score:.4f} rewards={rewards_str}")
 
-        total_score += final_score
-        
+    for i in range(num_scenarios):
+        room = WarRoom(seed=LLM_SEED, max_steps=MAX_STEPS)
+        obs, domain_observations = room.reset()
+        available_actions = obs.available_actions or []
+        playbook_text = obs.playbook_text or ""
+
+        min_reward = _calculate_dynamic_min_reward(room.env, MAX_STEPS)
+        max_success = 1.0 * MAX_STEPS
+        max_progress = 0.3 * MAX_STEPS
+        max_reward = max_success + max_progress
+
+        print(f"[START] scenario_{i+1} env=opssim_ai model={MODEL_NAME}")
+
+        rewards_list = []
+        for step in range(MAX_STEPS):
+            if room.is_done():
+                break
+
+            agent_messages = {}
+            for agent_name in AGENT_NAMES:
+                domain_obs = domain_observations.get(agent_name)
+                if domain_obs is None:
+                    domain_obs = room.env.get_domain_observation(agent_name)
+                prompt = build_domain_agent_prompt(agent_name, domain_obs, room.get_incident_channel())
+                text = call_llm(prompt, max_tokens=200)
+                parsed = parse_domain_response(text)
+                msg = f"[{parsed['severity'].upper()}] {parsed['observation']}"
+                if parsed["recommendation"]:
+                    msg += f" | Recommend: {parsed['recommendation']}"
+                agent_messages[agent_name] = msg
+
+            ic_prompt = build_ic_prompt(
+                room.get_incident_channel(),
+                available_actions,
+                playbook_text,
+                room.action_history,
+                step + 1,
+            )
+            ic_text = call_llm(ic_prompt, max_tokens=200)
+            directive = parse_ic_response(ic_text, available_actions)
+
+            result = room.run_step(agent_messages, directive)
+            reward_val = result["reward"].value
+            rewards_list.append(f"{reward_val:.2f}")
+
+            error_msg = room.env.last_action_error if room.env.last_action_error else "null"
+            print(
+                f"[STEP] step={step+1} target={directive['target_agent']} "
+                f"action={directive['action']} reward={reward_val:.2f} "
+                f"done={str(result['done']).lower()} error={error_msg}"
+            )
+
+            if result["done"]:
+                break
+
+            domain_observations = result.get("domain_observations", {})
+
+        total = room.get_total_reward()
+        score = max(0.0, min(1.0, (total - min_reward) / (max_reward - min_reward)))
+        success = "true" if (room.is_done() and total > 0) else "false"
+        print(f"[END] success={success} steps={room.step_count} score={score:.2f} rewards={','.join(rewards_list)}")
+        total_score += score
+
     return total_score / num_scenarios
 
-def main() -> None:
-    grade_easy()
-    grade_medium()
-    grade_hard()
+
+def main():
+    grade(num_scenarios=1)
+
 
 if __name__ == "__main__":
     main()

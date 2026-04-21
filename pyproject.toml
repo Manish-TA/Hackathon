@@ -1,7 +1,7 @@
 [project]
 name = "opssim_ai"
-version = "0.1.0"
-description = "RL environment for DevOps simulation"
+version = "1.0.0"
+description = "OpsSim-AI: Distributed War Room — Multi-Agent Cascading Failure System"
 requires-python = ">=3.11"
 authors = [{ name = "Sandeep, Venkatesh, Nithish" }]
 dependencies = [
@@ -22,7 +22,7 @@ build-backend = "setuptools.build_meta"
 server = "server.app:main"
 
 [tool.setuptools]
-py-modules = ["env", "models", "inference", "multi_agent", "train", "evaluate"]
+py-modules = ["env", "models", "inference", "multi_agent", "train"]
 
 [tool.setuptools.packages.find]
 include = ["server"]
