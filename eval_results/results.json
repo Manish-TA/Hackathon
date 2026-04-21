@@ -1,0 +1,15 @@
+{
+  "agent": "random",
+  "model": null,
+  "summary": {
+    "easy": {
+      "mean_reward": 0.615,
+      "max_reward": 1.1,
+      "min_reward": -1.4,
+      "mean_steps": 3.6,
+      "success_rate": 0.9,
+      "num_episodes": 20
+    }
+  },
+  "elapsed_seconds": 0.008907556533813477
+}

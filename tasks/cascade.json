@@ -1,0 +1,787 @@
+{
+  "cascade_tasks_dataset": [
+    {
+      "scenario_id": "cascade_001_checkout_meltdown",
+      "domain": "E-Commerce Platform",
+      "description": "Checkout is returning 500 errors. Multiple systems may be involved. Investigate before acting.",
+      "initial_state": {
+        "phase": "initial",
+        "checkout_status": "error_500",
+        "payment_service": "unknown",
+        "database_pool": "unknown",
+        "redis_cache": "unknown",
+        "dns_resolution": "unknown",
+        "discovered": {
+          "payment_checked": false,
+          "db_checked": false,
+          "cache_checked": false,
+          "root_cause_found": false,
+          "secondary_issue_found": false,
+          "db_connections_flushed": false
+        }
+      },
+      "playbook_text": "INCIDENT PROTOCOL: Always investigate before remediating. Check downstream dependencies first. Do not restart services blindly — identify the root cause.",
+      "available_actions": [
+        "investigate_payment_service",
+        "investigate_database",
+        "investigate_cache",
+        "investigate_dns",
+        "restart_checkout",
+        "restart_payment_service",
+        "flush_db_connections",
+        "reboot_redis",
+        "fix_dns_entry",
+        "do_nothing"
+      ],
+      "penalties": {
+        "restart_checkout": -0.5,
+        "restart_payment_service": -0.3
+      },
+      "optimal_solution_path": [
+        "investigate_payment_service",
+        "investigate_cache",
+        "reboot_redis",
+        "investigate_database",
+        "flush_db_connections",
+        "restart_checkout"
+      ],
+      "transition_rules": {
+        "investigate_payment_service": {
+          "condition": "discovered.payment_checked == false",
+          "effects": {
+            "discovered.payment_checked": true,
+            "payment_service": "timeout_upstream",
+            "phase": "investigating"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.1
+        },
+        "investigate_cache": {
+          "condition": "discovered.cache_checked == false",
+          "effects": {
+            "discovered.cache_checked": true,
+            "redis_cache": "connection_refused",
+            "discovered.root_cause_found": true
+          },
+          "else_effects": {},
+          "reward": 0.25,
+          "else_reward": -0.1
+        },
+        "investigate_database": {
+          "condition": "discovered.db_checked == false",
+          "effects": {
+            "discovered.db_checked": true,
+            "database_pool": "stale_connections"
+          },
+          "else_effects": {},
+          "reward": 0.15,
+          "else_reward": -0.1
+        },
+        "investigate_dns": {
+          "condition": "dns_resolution == 'unknown'",
+          "effects": {
+            "dns_resolution": "healthy"
+          },
+          "else_effects": {},
+          "reward": 0.05,
+          "else_reward": -0.05
+        },
+        "reboot_redis": {
+          "condition": "discovered.root_cause_found == true AND redis_cache == 'connection_refused'",
+          "effects": {
+            "redis_cache": "online",
+            "payment_service": "recovering",
+            "discovered.secondary_issue_found": true,
+            "database_pool": "stale_connections"
+          },
+          "else_effects": {
+            "redis_cache": "unknown"
+          },
+          "reward": 0.3,
+          "else_reward": -0.4
+        },
+        "flush_db_connections": {
+          "condition": "discovered.secondary_issue_found == true AND database_pool == 'stale_connections'",
+          "effects": {
+            "database_pool": "healthy",
+            "discovered.db_connections_flushed": true
+          },
+          "else_effects": {},
+          "reward": 0.25,
+          "else_reward": -0.3
+        },
+        "restart_checkout": {
+          "condition": "redis_cache == 'online' AND discovered.db_connections_flushed == true",
+          "effects": {
+            "checkout_status": "online",
+            "payment_service": "online"
+          },
+          "else_effects": {
+            "checkout_status": "error_500"
+          },
+          "reward": 0.5,
+          "else_reward": -0.5
+        },
+        "restart_payment_service": {
+          "condition": "1 == 1",
+          "effects": {
+            "payment_service": "timeout_upstream"
+          },
+          "reward": -0.3
+        },
+        "fix_dns_entry": {
+          "condition": "dns_resolution != 'healthy'",
+          "effects": {
+            "dns_resolution": "healthy"
+          },
+          "reward": 0.0,
+          "else_reward": -0.1
+        }
+      },
+      "bleed_rules": [
+        {"condition": "checkout_status == 'error_500'", "penalty": -0.08},
+        {"condition": "redis_cache == 'connection_refused'", "penalty": -0.05}
+      ],
+      "sla_rules": {
+        "required": [
+          "checkout_status == 'online'",
+          "payment_service == 'online'",
+          "database_pool == 'healthy'"
+        ],
+        "forbidden": []
+      },
+      "sla_violation_penalty": -1.0
+    },
+    {
+      "scenario_id": "cascade_002_deploy_gone_wrong",
+      "domain": "CI/CD & Deployment",
+      "description": "A canary deploy triggered alerts across monitoring. Latency is spiking but the cause is unclear. Investigate the deployment pipeline and downstream effects.",
+      "initial_state": {
+        "phase": "initial",
+        "canary_status": "deployed",
+        "latency_p99": "800ms",
+        "error_rate": "12%",
+        "config_version": "v2.3.1-canary",
+        "feature_flag_state": "unknown",
+        "memory_leak": "unknown",
+        "old_pods_status": "unknown",
+        "discovered": {
+          "checked_canary_logs": false,
+          "checked_metrics": false,
+          "checked_old_pods": false,
+          "found_memory_leak": false,
+          "found_config_mismatch": false,
+          "canary_rolled_back": false,
+          "old_pods_cleaned": false
+        }
+      },
+      "playbook_text": "DEPLOY PROTOCOL: Never fully rollback without investigating. Check canary logs, then metrics, then pod health. Feature flags may mask issues.",
+      "available_actions": [
+        "check_canary_logs",
+        "check_latency_metrics",
+        "check_old_pods",
+        "inspect_feature_flags",
+        "rollback_canary",
+        "force_full_rollback",
+        "restart_old_pods",
+        "toggle_feature_flag",
+        "scale_up_healthy_pods",
+        "do_nothing"
+      ],
+      "penalties": {
+        "force_full_rollback": -0.8
+      },
+      "optimal_solution_path": [
+        "check_canary_logs",
+        "check_latency_metrics",
+        "rollback_canary",
+        "check_old_pods",
+        "restart_old_pods",
+        "scale_up_healthy_pods"
+      ],
+      "transition_rules": {
+        "check_canary_logs": {
+          "condition": "discovered.checked_canary_logs == false",
+          "effects": {
+            "discovered.checked_canary_logs": true,
+            "memory_leak": "detected_in_canary",
+            "discovered.found_memory_leak": true,
+            "phase": "investigating"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.1
+        },
+        "check_latency_metrics": {
+          "condition": "discovered.checked_metrics == false",
+          "effects": {
+            "discovered.checked_metrics": true,
+            "discovered.found_config_mismatch": true,
+            "feature_flag_state": "misconfigured"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.1
+        },
+        "rollback_canary": {
+          "condition": "discovered.found_memory_leak == true",
+          "effects": {
+            "canary_status": "rolled_back",
+            "config_version": "v2.3.0-stable",
+            "latency_p99": "400ms",
+            "error_rate": "5%",
+            "discovered.canary_rolled_back": true
+          },
+          "else_effects": {
+            "error_rate": "15%"
+          },
+          "reward": 0.3,
+          "else_reward": -0.4
+        },
+        "check_old_pods": {
+          "condition": "discovered.canary_rolled_back == true AND discovered.checked_old_pods == false",
+          "effects": {
+            "discovered.checked_old_pods": true,
+            "old_pods_status": "zombie_state"
+          },
+          "else_effects": {},
+          "reward": 0.15,
+          "else_reward": -0.05
+        },
+        "restart_old_pods": {
+          "condition": "old_pods_status == 'zombie_state'",
+          "effects": {
+            "old_pods_status": "healthy",
+            "latency_p99": "150ms",
+            "error_rate": "1%",
+            "discovered.old_pods_cleaned": true
+          },
+          "else_effects": {},
+          "reward": 0.25,
+          "else_reward": -0.2
+        },
+        "scale_up_healthy_pods": {
+          "condition": "discovered.old_pods_cleaned == true",
+          "effects": {
+            "latency_p99": "50ms",
+            "error_rate": "0.1%"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.1
+        },
+        "inspect_feature_flags": {
+          "condition": "feature_flag_state == 'misconfigured'",
+          "effects": {
+            "feature_flag_state": "identified"
+          },
+          "reward": 0.1,
+          "else_reward": 0.0
+        },
+        "toggle_feature_flag": {
+          "condition": "feature_flag_state == 'identified'",
+          "effects": {
+            "feature_flag_state": "corrected"
+          },
+          "reward": 0.1,
+          "else_reward": -0.15
+        },
+        "force_full_rollback": {
+          "condition": "1 == 1",
+          "effects": {
+            "canary_status": "rolled_back",
+            "config_version": "v2.2.0-old",
+            "latency_p99": "300ms"
+          },
+          "reward": -0.8
+        }
+      },
+      "bleed_rules": [
+        {"condition": "error_rate == '12%'", "penalty": -0.1},
+        {"condition": "error_rate == '5%'", "penalty": -0.03},
+        {"condition": "old_pods_status == 'zombie_state'", "penalty": -0.05}
+      ],
+      "sla_rules": {
+        "required": [
+          "canary_status == 'rolled_back'",
+          "old_pods_status == 'healthy'"
+        ],
+        "forbidden": [
+          "config_version == 'v2.2.0-old'"
+        ]
+      },
+      "sla_violation_penalty": -1.0
+    },
+    {
+      "scenario_id": "cascade_003_network_partition",
+      "domain": "Distributed Systems",
+      "description": "A network partition has split the cluster. Some nodes are unreachable but the scope of damage is unclear. Diagnose before reconnecting.",
+      "initial_state": {
+        "partition_detected": true,
+        "zone_a_status": "isolated",
+        "zone_b_status": "isolated",
+        "leader_election": "stalled",
+        "data_consistency": "unknown",
+        "replication_lag": "unknown",
+        "quorum_status": "unknown",
+        "discovered": {
+          "scanned_zone_a": false,
+          "scanned_zone_b": false,
+          "checked_replication": false,
+          "checked_quorum": false,
+          "partition_healed": false,
+          "leader_elected": false
+        }
+      },
+      "playbook_text": "PARTITION PROTOCOL: 1) Scan both zones. 2) Check replication lag — if data diverged, do NOT force reconnect. 3) Verify quorum before electing leader. 4) Heal partition only after full diagnosis.",
+      "available_actions": [
+        "scan_zone_a",
+        "scan_zone_b",
+        "check_replication_lag",
+        "check_quorum_status",
+        "heal_partition",
+        "force_reconnect",
+        "trigger_leader_election",
+        "force_leader_zone_a",
+        "reconcile_data",
+        "do_nothing"
+      ],
+      "penalties": {
+        "force_reconnect": -0.8,
+        "force_leader_zone_a": -0.5
+      },
+      "optimal_solution_path": [
+        "scan_zone_a",
+        "scan_zone_b",
+        "check_replication_lag",
+        "reconcile_data",
+        "check_quorum_status",
+        "heal_partition",
+        "trigger_leader_election"
+      ],
+      "transition_rules": {
+        "scan_zone_a": {
+          "condition": "discovered.scanned_zone_a == false",
+          "effects": {
+            "discovered.scanned_zone_a": true,
+            "zone_a_status": "3_nodes_healthy"
+          },
+          "else_effects": {},
+          "reward": 0.15,
+          "else_reward": -0.1
+        },
+        "scan_zone_b": {
+          "condition": "discovered.scanned_zone_b == false",
+          "effects": {
+            "discovered.scanned_zone_b": true,
+            "zone_b_status": "2_nodes_healthy_1_degraded"
+          },
+          "else_effects": {},
+          "reward": 0.15,
+          "else_reward": -0.1
+        },
+        "check_replication_lag": {
+          "condition": "discovered.scanned_zone_a == true AND discovered.scanned_zone_b == true AND discovered.checked_replication == false",
+          "effects": {
+            "discovered.checked_replication": true,
+            "replication_lag": "45_seconds_diverged",
+            "data_consistency": "diverged"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.15
+        },
+        "reconcile_data": {
+          "condition": "data_consistency == 'diverged'",
+          "effects": {
+            "data_consistency": "reconciled",
+            "replication_lag": "0_seconds"
+          },
+          "else_effects": {},
+          "reward": 0.25,
+          "else_reward": -0.2
+        },
+        "check_quorum_status": {
+          "condition": "data_consistency == 'reconciled' AND discovered.checked_quorum == false",
+          "effects": {
+            "discovered.checked_quorum": true,
+            "quorum_status": "achievable"
+          },
+          "else_effects": {},
+          "reward": 0.15,
+          "else_reward": -0.1
+        },
+        "heal_partition": {
+          "condition": "quorum_status == 'achievable' AND data_consistency == 'reconciled'",
+          "effects": {
+            "partition_detected": false,
+            "zone_a_status": "connected",
+            "zone_b_status": "connected",
+            "discovered.partition_healed": true
+          },
+          "else_effects": {
+            "data_consistency": "corrupted"
+          },
+          "reward": 0.3,
+          "else_reward": -0.8
+        },
+        "trigger_leader_election": {
+          "condition": "discovered.partition_healed == true",
+          "effects": {
+            "leader_election": "completed",
+            "discovered.leader_elected": true
+          },
+          "else_effects": {
+            "leader_election": "failed"
+          },
+          "reward": 0.3,
+          "else_reward": -0.4
+        },
+        "force_reconnect": {
+          "condition": "1 == 1",
+          "effects": {
+            "data_consistency": "corrupted",
+            "zone_a_status": "connected_corrupt",
+            "zone_b_status": "connected_corrupt"
+          },
+          "reward": -0.8
+        },
+        "force_leader_zone_a": {
+          "condition": "1 == 1",
+          "effects": {
+            "leader_election": "forced_a"
+          },
+          "reward": -0.5
+        }
+      },
+      "bleed_rules": [
+        {"condition": "partition_detected == true", "penalty": -0.08},
+        {"condition": "leader_election == 'stalled'", "penalty": -0.05},
+        {"condition": "data_consistency == 'corrupted'", "penalty": -0.3}
+      ],
+      "sla_rules": {
+        "required": [
+          "partition_detected == false",
+          "leader_election == 'completed'",
+          "data_consistency == 'reconciled'"
+        ],
+        "forbidden": [
+          "data_consistency == 'corrupted'"
+        ]
+      },
+      "sla_violation_penalty": -1.5
+    },
+    {
+      "scenario_id": "cascade_004_storage_corruption_chain",
+      "domain": "Storage & Data Infrastructure",
+      "description": "Users report missing files. The storage layer may be corrupted but the extent is unknown. Investigate carefully — wrong actions could cause data loss.",
+      "initial_state": {
+        "primary_storage": "degraded",
+        "replica_storage": "unknown",
+        "filesystem_check": "not_run",
+        "backup_status": "unknown",
+        "corruption_extent": "unknown",
+        "write_ahead_log": "unknown",
+        "service_mode": "normal",
+        "discovered": {
+          "checked_primary": false,
+          "checked_replica": false,
+          "checked_backup": false,
+          "checked_wal": false,
+          "corruption_mapped": false,
+          "recovery_ready": false
+        }
+      },
+      "playbook_text": "DATA INCIDENT PROTOCOL: 1) IMMEDIATELY set read-only mode to prevent further writes. 2) Check WAL before anything. 3) Map corruption extent. 4) Never restore from backup without verifying replica first.",
+      "available_actions": [
+        "set_read_only_mode",
+        "check_primary_filesystem",
+        "check_replica_status",
+        "check_backup_integrity",
+        "check_write_ahead_log",
+        "restore_from_backup",
+        "restore_from_replica",
+        "run_fsck_repair",
+        "resume_writes",
+        "do_nothing"
+      ],
+      "penalties": {
+        "restore_from_backup": -0.6,
+        "resume_writes": -0.4
+      },
+      "optimal_solution_path": [
+        "set_read_only_mode",
+        "check_write_ahead_log",
+        "check_primary_filesystem",
+        "check_replica_status",
+        "restore_from_replica",
+        "run_fsck_repair",
+        "resume_writes"
+      ],
+      "transition_rules": {
+        "set_read_only_mode": {
+          "condition": "service_mode == 'normal'",
+          "effects": {
+            "service_mode": "read_only"
+          },
+          "reward": 0.2,
+          "else_reward": -0.05
+        },
+        "check_write_ahead_log": {
+          "condition": "service_mode == 'read_only' AND discovered.checked_wal == false",
+          "effects": {
+            "discovered.checked_wal": true,
+            "write_ahead_log": "15_transactions_uncommitted"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.1
+        },
+        "check_primary_filesystem": {
+          "condition": "discovered.checked_wal == true AND discovered.checked_primary == false",
+          "effects": {
+            "discovered.checked_primary": true,
+            "filesystem_check": "3_blocks_corrupted",
+            "corruption_extent": "partial_sector_7",
+            "discovered.corruption_mapped": true
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.1
+        },
+        "check_replica_status": {
+          "condition": "discovered.corruption_mapped == true AND discovered.checked_replica == false",
+          "effects": {
+            "discovered.checked_replica": true,
+            "replica_storage": "healthy_but_behind_15_txns"
+          },
+          "else_effects": {},
+          "reward": 0.15,
+          "else_reward": -0.1
+        },
+        "check_backup_integrity": {
+          "condition": "discovered.checked_backup == false",
+          "effects": {
+            "discovered.checked_backup": true,
+            "backup_status": "24h_old_verified"
+          },
+          "reward": 0.1,
+          "else_reward": -0.05
+        },
+        "restore_from_replica": {
+          "condition": "discovered.checked_replica == true AND replica_storage == 'healthy_but_behind_15_txns'",
+          "effects": {
+            "primary_storage": "restored_from_replica",
+            "corruption_extent": "resolved",
+            "discovered.recovery_ready": true
+          },
+          "else_effects": {
+            "primary_storage": "corrupted_worse"
+          },
+          "reward": 0.3,
+          "else_reward": -0.7
+        },
+        "run_fsck_repair": {
+          "condition": "discovered.recovery_ready == true",
+          "effects": {
+            "primary_storage": "healthy",
+            "filesystem_check": "clean"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.3
+        },
+        "resume_writes": {
+          "condition": "primary_storage == 'healthy'",
+          "effects": {
+            "service_mode": "normal",
+            "write_ahead_log": "replaying"
+          },
+          "else_effects": {
+            "primary_storage": "corrupted_worse"
+          },
+          "reward": 0.3,
+          "else_reward": -0.8
+        },
+        "restore_from_backup": {
+          "condition": "1 == 1",
+          "effects": {
+            "primary_storage": "restored_24h_old",
+            "write_ahead_log": "lost"
+          },
+          "reward": -0.6
+        }
+      },
+      "bleed_rules": [
+        {"condition": "primary_storage == 'degraded'", "penalty": -0.05},
+        {"condition": "primary_storage == 'corrupted_worse'", "penalty": -0.3},
+        {"condition": "service_mode == 'normal' AND primary_storage != 'healthy'", "penalty": -0.1}
+      ],
+      "sla_rules": {
+        "required": [
+          "primary_storage == 'healthy'",
+          "service_mode == 'normal'"
+        ],
+        "forbidden": [
+          "primary_storage == 'corrupted_worse'",
+          "write_ahead_log == 'lost'"
+        ]
+      },
+      "sla_violation_penalty": -1.5
+    },
+    {
+      "scenario_id": "cascade_005_auth_breach_chain",
+      "domain": "Security & Identity",
+      "description": "Anomalous login patterns detected. A possible credential breach, but scope is unclear. Investigate the chain: entry point → lateral movement → data access.",
+      "initial_state": {
+        "alert_type": "anomalous_logins",
+        "compromised_accounts": "unknown",
+        "lateral_movement": "unknown",
+        "data_exfiltration": "unknown",
+        "mfa_status": "unknown",
+        "api_keys_status": "unknown",
+        "incident_contained": false,
+        "discovered": {
+          "analyzed_logins": false,
+          "traced_lateral": false,
+          "checked_data_access": false,
+          "checked_mfa": false,
+          "checked_api_keys": false,
+          "accounts_locked": false,
+          "keys_rotated": false
+        }
+      },
+      "playbook_text": "SECURITY INCIDENT RESPONSE: 1) Analyze login anomalies to identify compromised accounts. 2) Trace lateral movement. 3) Check data access logs. 4) Lock compromised accounts. 5) Rotate exposed API keys. Do NOT rotate keys before identifying which are compromised — you'll cause an outage.",
+      "available_actions": [
+        "analyze_login_anomalies",
+        "trace_lateral_movement",
+        "audit_data_access_logs",
+        "check_mfa_bypass",
+        "check_api_key_usage",
+        "lock_compromised_accounts",
+        "rotate_all_api_keys",
+        "rotate_compromised_keys",
+        "enable_enhanced_monitoring",
+        "do_nothing"
+      ],
+      "penalties": {
+        "rotate_all_api_keys": -0.7
+      },
+      "optimal_solution_path": [
+        "analyze_login_anomalies",
+        "trace_lateral_movement",
+        "audit_data_access_logs",
+        "lock_compromised_accounts",
+        "check_api_key_usage",
+        "rotate_compromised_keys",
+        "enable_enhanced_monitoring"
+      ],
+      "transition_rules": {
+        "analyze_login_anomalies": {
+          "condition": "discovered.analyzed_logins == false",
+          "effects": {
+            "discovered.analyzed_logins": true,
+            "compromised_accounts": "3_service_accounts"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.1
+        },
+        "trace_lateral_movement": {
+          "condition": "discovered.analyzed_logins == true AND discovered.traced_lateral == false",
+          "effects": {
+            "discovered.traced_lateral": true,
+            "lateral_movement": "detected_2_hops"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.15
+        },
+        "audit_data_access_logs": {
+          "condition": "discovered.traced_lateral == true AND discovered.checked_data_access == false",
+          "effects": {
+            "discovered.checked_data_access": true,
+            "data_exfiltration": "attempted_not_completed"
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.1
+        },
+        "lock_compromised_accounts": {
+          "condition": "compromised_accounts == '3_service_accounts'",
+          "effects": {
+            "discovered.accounts_locked": true,
+            "compromised_accounts": "locked",
+            "lateral_movement": "contained"
+          },
+          "else_effects": {},
+          "reward": 0.25,
+          "else_reward": -0.2
+        },
+        "check_mfa_bypass": {
+          "condition": "discovered.checked_mfa == false",
+          "effects": {
+            "discovered.checked_mfa": true,
+            "mfa_status": "bypass_detected_on_2_accounts"
+          },
+          "reward": 0.1,
+          "else_reward": -0.05
+        },
+        "check_api_key_usage": {
+          "condition": "discovered.accounts_locked == true AND discovered.checked_api_keys == false",
+          "effects": {
+            "discovered.checked_api_keys": true,
+            "api_keys_status": "2_keys_used_suspiciously"
+          },
+          "else_effects": {},
+          "reward": 0.15,
+          "else_reward": -0.1
+        },
+        "rotate_compromised_keys": {
+          "condition": "discovered.checked_api_keys == true AND api_keys_status == '2_keys_used_suspiciously'",
+          "effects": {
+            "api_keys_status": "rotated_targeted",
+            "discovered.keys_rotated": true
+          },
+          "else_effects": {},
+          "reward": 0.25,
+          "else_reward": -0.3
+        },
+        "rotate_all_api_keys": {
+          "condition": "1 == 1",
+          "effects": {
+            "api_keys_status": "all_rotated_outage_triggered"
+          },
+          "reward": -0.7
+        },
+        "enable_enhanced_monitoring": {
+          "condition": "discovered.keys_rotated == true AND discovered.accounts_locked == true",
+          "effects": {
+            "incident_contained": true
+          },
+          "else_effects": {},
+          "reward": 0.2,
+          "else_reward": -0.05
+        }
+      },
+      "bleed_rules": [
+        {"condition": "compromised_accounts == '3_service_accounts'", "penalty": -0.1},
+        {"condition": "lateral_movement == 'detected_2_hops'", "penalty": -0.08},
+        {"condition": "data_exfiltration == 'completed'", "penalty": -0.5}
+      ],
+      "sla_rules": {
+        "required": [
+          "incident_contained == true",
+          "discovered.accounts_locked == true",
+          "discovered.keys_rotated == true"
+        ],
+        "forbidden": [
+          "api_keys_status == 'all_rotated_outage_triggered'",
+          "data_exfiltration == 'completed'"
+        ]
+      },
+      "sla_violation_penalty": -1.5
+    }
+  ]
+}
