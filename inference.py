@@ -132,38 +132,32 @@ class StrategyTracker:
         self.phase = "investigate"
         self.committed = False
         self.root_cause_locked = False
+        self.last_confidence_source = "init"
 
     @staticmethod
     def _is_investigation(action):
         a = (action or "").lower()
         return "investigate" in a or a.startswith("check_") or "diagnose" in a or "inspect" in a
 
-    def seed_from_observability(self, obs_data, root_cause_keywords, system_state):
-        if obs_data and obs_data.get("root_cause_analysis"):
-            text = str(obs_data.get("root_cause_analysis", "")).lower()
-            hits = sum(1 for kw in root_cause_keywords if kw.lower() in text)
-            if hits >= max(1, len(root_cause_keywords) // 2):
-                self.confidence = max(self.confidence, 0.35)
+    def ingest_llm_confidence(self, value, source="llm"):
+        if value is None:
+            return
+        try:
+            c = float(value)
+        except (TypeError, ValueError):
+            return
+        if c < 0.0 or c > 1.0:
+            return
+        self.confidence = c
+        self.last_confidence_source = source
 
     def record_step(self, action, reward, discovered_after):
-        is_invest = self._is_investigation(action)
-        if is_invest:
+        if self._is_investigation(action):
             self.investigation_count += 1
-            if reward > 0:
-                self.confidence += 0.25
-            elif reward < -0.15:
-                self.confidence = max(0.0, self.confidence - 0.05)
-        else:
-            if reward > 0:
-                self.confidence += 0.15
-            elif reward < -0.15:
-                self.confidence = max(0.0, self.confidence - 0.1)
         if discovered_after:
             root_hits = sum(1 for k, v in discovered_after.items() if "root_cause" in k and v)
             if root_hits:
-                self.confidence = max(self.confidence, 0.75)
                 self.root_cause_locked = True
-        self.confidence = max(0.0, min(1.0, self.confidence))
         if not self.committed:
             if (self.confidence >= self.CONFIDENCE_THRESHOLD
                     or self.investigation_count >= self.INVESTIGATION_LIMIT
@@ -186,6 +180,7 @@ class StrategyTracker:
 
     def format_status(self):
         return (f"  phase={self.phase} confidence={self.confidence:.2f} "
+                f"source={self.last_confidence_source} "
                 f"investigations={self.investigation_count}/{self.INVESTIGATION_LIMIT} "
                 f"committed={self.committed}")
 
@@ -347,7 +342,7 @@ Anomalies:
 You MUST include these keywords in your analysis: {', '.join(root_cause_keywords)}
 
 Return ONLY JSON:
-{{"root_cause_analysis": "<analysis using the keywords above>", "cascade_chain": "<A causes B causes C>"}}"""
+{{"root_cause_analysis": "<analysis using the keywords above>", "cascade_chain": "<A causes B causes C>", "confidence": <number between 0.0 and 1.0 reflecting how certain you are of the root cause>}}"""
 
 
 def build_planning_prompt(system_state, playbook_text, memory, planner,
@@ -453,13 +448,15 @@ RULES:
 - reasoning MUST explicitly reference prior outcomes or observed state (not generic text).
 
 Return ONLY JSON:
-{{"analysis": "<situation assessment grounded in state+memory>", "plan": ["action1", "action2", ...], "next_action": "<action_name>", "target_agent": "<AgentName>", "reasoning": "<why this action next, citing memory/state>"}}"""
+{{"analysis": "<situation assessment grounded in state+memory>", "plan": ["action1", "action2", ...], "next_action": "<action_name>", "target_agent": "<AgentName>", "reasoning": "<why this action next, citing memory/state>", "confidence": <number between 0.0 and 1.0 reflecting how certain you are of the root cause / fix strategy>}}"""
 
 
 def _parse_planning_response(text, available_actions, action_domains, memory, obs_actions, env, strategy=None):
     data = _extract_json(text)
     invalid_reason = "no_json"
+    llm_confidence = None
     if data:
+        llm_confidence = data.get("confidence")
         plan = data.get("plan", [])
         action = data.get("next_action", "")
         valid_plan = [a for a in plan if a in available_actions and a not in memory.completed_actions and a not in obs_actions]
@@ -487,7 +484,7 @@ def _parse_planning_response(text, available_actions, action_domains, memory, ob
                 if correct_agent:
                     return {"action": action, "target_agent": correct_agent, "plan": valid_plan,
                             "analysis": data.get("analysis", ""), "reasoning": data.get("reasoning", ""),
-                            "llm_decided": True, "invalid_reason": ""}
+                            "llm_decided": True, "invalid_reason": "", "confidence": llm_confidence}
                 invalid_reason = "no_agent"
 
         for pa in valid_plan:
@@ -499,22 +496,24 @@ def _parse_planning_response(text, available_actions, action_domains, memory, ob
             if agent:
                 return {"action": pa, "target_agent": agent, "plan": valid_plan,
                         "analysis": data.get("analysis", ""), "reasoning": "from_llm_plan",
-                        "llm_decided": True, "invalid_reason": ""}
-
-    fa, ag = _state_aware_select(env, available_actions, memory, obs_actions, action_domains)
-    if fa and (strategy is None or not (not strategy.allow_investigation() and StrategyTracker._is_investigation(fa))):
-        return {"action": fa, "target_agent": ag, "plan": [], "analysis": "", "reasoning": "safety_fallback_state_aware", "llm_decided": False, "invalid_reason": invalid_reason}
+                        "llm_decided": True, "invalid_reason": "", "confidence": llm_confidence}
 
     for action in available_actions:
         if action in memory.completed_actions or action in obs_actions:
+            continue
+        if action in memory.failed_actions:
             continue
         if strategy is not None and not strategy.allow_investigation() and StrategyTracker._is_investigation(action):
             continue
         agent = _agent_for_action(action, action_domains)
         if agent:
-            return {"action": action, "target_agent": agent, "plan": [], "analysis": "", "reasoning": "safety_fallback_last_resort", "llm_decided": False, "invalid_reason": invalid_reason}
+            return {"action": action, "target_agent": agent, "plan": [], "analysis": "",
+                    "reasoning": "safety_fallback_invalid_llm", "llm_decided": False,
+                    "invalid_reason": invalid_reason, "confidence": llm_confidence}
 
-    return {"action": "do_nothing", "target_agent": "AppOps", "plan": [], "analysis": "", "reasoning": "exhausted", "llm_decided": False, "invalid_reason": invalid_reason}
+    return {"action": "do_nothing", "target_agent": "AppOps", "plan": [], "analysis": "",
+            "reasoning": "exhausted", "llm_decided": False, "invalid_reason": invalid_reason,
+            "confidence": llm_confidence}
 
 
 def _run_episode_core(room):
@@ -539,10 +538,10 @@ def _run_episode_core(room):
     if obs_data:
         obs_msg = f"[ROOT CAUSE] {obs_data.get('root_cause_analysis', '')} | Chain: {obs_data.get('cascade_chain', '')}"
         memory.root_cause_analysis = obs_data.get("root_cause_analysis", "")
+        strategy.ingest_llm_confidence(obs_data.get("confidence"), source="observability_llm")
     else:
         obs_msg = f"[ROOT CAUSE] Detected anomalies involving: {', '.join(root_cause_keywords)}"
         memory.root_cause_analysis = f"Anomalies involving: {', '.join(root_cause_keywords)}"
-    strategy.seed_from_observability(obs_data, root_cause_keywords, system_state)
     room.observe_and_communicate("ObservabilityOps", obs_msg)
 
     rewards_list = []
@@ -575,6 +574,10 @@ def _run_episode_core(room):
         analysis = decision.get("analysis", "")
         reasoning = decision.get("reasoning", "")
         invalid_reason = decision.get("invalid_reason", "")
+        llm_confidence_raw = decision.get("confidence")
+
+        if llm_decided:
+            strategy.ingest_llm_confidence(llm_confidence_raw, source="planner_llm")
 
         allow_revision = strategy.should_revise_plan(memory)
         planner.maybe_update(new_plan, allow_revision)
