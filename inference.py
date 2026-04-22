@@ -85,11 +85,32 @@ class PlanTracker:
     def __init__(self):
         self.current_plan = []
         self.revision_count = 0
+        self.steps_since_revision = 0
+        self.last_signature = None
 
     def update(self, new_plan):
         if new_plan and new_plan != self.current_plan:
-            self.current_plan = new_plan
+            self.current_plan = list(new_plan)
             self.revision_count += 1
+            self.steps_since_revision = 0
+            self.last_signature = tuple(new_plan)
+
+    def maybe_update(self, new_plan, allow_revision):
+        self.steps_since_revision += 1
+        if not new_plan:
+            return
+        signature = tuple(new_plan)
+        if not self.current_plan:
+            self.current_plan = list(new_plan)
+            self.revision_count += 1
+            self.steps_since_revision = 0
+            self.last_signature = signature
+            return
+        if allow_revision and signature != self.last_signature:
+            self.current_plan = list(new_plan)
+            self.revision_count += 1
+            self.steps_since_revision = 0
+            self.last_signature = signature
 
     def mark_done(self, action):
         if action in self.current_plan:
@@ -99,6 +120,74 @@ class PlanTracker:
         if not self.current_plan:
             return "  No plan yet. Create one."
         return "\n".join(f"  {i+1}. {a}" for i, a in enumerate(self.current_plan))
+
+
+class StrategyTracker:
+    INVESTIGATION_LIMIT = 3
+    CONFIDENCE_THRESHOLD = 0.6
+
+    def __init__(self):
+        self.investigation_count = 0
+        self.confidence = 0.0
+        self.phase = "investigate"
+        self.committed = False
+        self.root_cause_locked = False
+
+    @staticmethod
+    def _is_investigation(action):
+        a = (action or "").lower()
+        return "investigate" in a or a.startswith("check_") or "diagnose" in a or "inspect" in a
+
+    def seed_from_observability(self, obs_data, root_cause_keywords, system_state):
+        if obs_data and obs_data.get("root_cause_analysis"):
+            text = str(obs_data.get("root_cause_analysis", "")).lower()
+            hits = sum(1 for kw in root_cause_keywords if kw.lower() in text)
+            if hits >= max(1, len(root_cause_keywords) // 2):
+                self.confidence = max(self.confidence, 0.35)
+
+    def record_step(self, action, reward, discovered_after):
+        is_invest = self._is_investigation(action)
+        if is_invest:
+            self.investigation_count += 1
+            if reward > 0:
+                self.confidence += 0.25
+            elif reward < -0.15:
+                self.confidence = max(0.0, self.confidence - 0.05)
+        else:
+            if reward > 0:
+                self.confidence += 0.15
+            elif reward < -0.15:
+                self.confidence = max(0.0, self.confidence - 0.1)
+        if discovered_after:
+            root_hits = sum(1 for k, v in discovered_after.items() if "root_cause" in k and v)
+            if root_hits:
+                self.confidence = max(self.confidence, 0.75)
+                self.root_cause_locked = True
+        self.confidence = max(0.0, min(1.0, self.confidence))
+        if not self.committed:
+            if (self.confidence >= self.CONFIDENCE_THRESHOLD
+                    or self.investigation_count >= self.INVESTIGATION_LIMIT
+                    or self.root_cause_locked):
+                self.phase = "execute"
+                self.committed = True
+
+    def allow_investigation(self):
+        return not self.committed and self.investigation_count < self.INVESTIGATION_LIMIT
+
+    def should_revise_plan(self, memory):
+        if not memory.actions:
+            return True
+        last = memory.actions[-1]
+        if last["reward"] < -0.15:
+            return True
+        if memory.is_stagnating():
+            return True
+        return False
+
+    def format_status(self):
+        return (f"  phase={self.phase} confidence={self.confidence:.2f} "
+                f"investigations={self.investigation_count}/{self.INVESTIGATION_LIMIT} "
+                f"committed={self.committed}")
 
 
 def call_llm(prompt, max_tokens=250):
@@ -263,7 +352,8 @@ Return ONLY JSON:
 
 def build_planning_prompt(system_state, playbook_text, memory, planner,
                           action_domains, obs_actions, step_count, goal_state,
-                          progress, description, available_actions, suggested_order):
+                          progress, description, available_actions, suggested_order,
+                          strategy=None):
     anomalies = _get_anomalies(system_state)
     anomaly_text = "\n".join(anomalies) if anomalies else "  All healthy"
 
@@ -273,12 +363,19 @@ def build_planning_prompt(system_state, playbook_text, memory, planner,
     history_text = memory.format_history()
     plan_text = planner.format_plan()
 
+    allow_invest = True if strategy is None else strategy.allow_investigation()
     avail_text = ""
     for domain, actions in action_domains.items():
         if domain == "observability":
             continue
         agent = DOMAIN_TO_AGENT.get(domain, domain)
-        filtered = [a for a in actions if a not in memory.completed_actions and a not in obs_actions]
+        filtered = []
+        for a in actions:
+            if a in memory.completed_actions or a in obs_actions:
+                continue
+            if not allow_invest and StrategyTracker._is_investigation(a):
+                continue
+            filtered.append(a)
         if filtered:
             avail_text += f"  {agent}: {', '.join(filtered)}\n"
 
@@ -300,10 +397,27 @@ def build_planning_prompt(system_state, playbook_text, memory, planner,
     if suggested_order:
         remaining_hints = [a for a in suggested_order if a not in memory.completed_actions]
         if remaining_hints:
-            hint_text = f"\nSUGGESTED ORDER (hint, adapt as needed): {' -> '.join(remaining_hints)}"
+            hint_text = f"\nSUGGESTED ORDER (reference only, you decide): {' -> '.join(remaining_hints)}"
+
+    strategy_text = ""
+    phase_rule = ""
+    if strategy is not None:
+        strategy_text = "\nSTRATEGY STATE:\n" + strategy.format_status()
+        if strategy.phase == "execute" or not strategy.allow_investigation():
+            phase_rule = ("\nPHASE RULE: Investigation phase is CLOSED. "
+                          "You MUST commit to fix/execution actions now. "
+                          "Do NOT choose investigate_* or check_* actions.")
+        else:
+            remaining = max(0, StrategyTracker.INVESTIGATION_LIMIT - strategy.investigation_count)
+            phase_rule = (f"\nPHASE RULE: You have at most {remaining} investigation step(s) left. "
+                          "Diagnose quickly then COMMIT to fixes.")
+        if strategy.should_revise_plan(memory):
+            phase_rule += "\nPLAN RULE: Revise plan now (failure or stagnation detected)."
+        else:
+            phase_rule += "\nPLAN RULE: Keep current plan stable. Only revise if truly necessary."
 
     return f"""DO NOT output anything except valid JSON.
-You are the Incident Commander. Analyze the situation, maintain your plan, and choose the next action.
+You are the Incident Commander. You are the PRIMARY decision-maker. Reason step by step from the memory, plan, and system state, then choose the next action.
 
 INCIDENT: {description}
 PLAYBOOK: {playbook_text}{root_note}
@@ -319,60 +433,88 @@ ACTION HISTORY & OUTCOMES:
 
 CURRENT PLAN:
 {plan_text}
+{strategy_text}
 
 UNMET SLA GOALS:
 {unmet_text}
 
 AVAILABLE ACTIONS (by domain agent):
-{avail_text}{hint_text}{warnings}
+{avail_text}{hint_text}{warnings}{phase_rule}
 
 Step {step_count}/{MAX_STEPS} | Progress: {progress:.0%}
 
 RULES:
-- Investigate before fixing. Fix root causes before symptoms.
-- Dependencies: infrastructure -> database -> application.
+- Your decision MUST be grounded in: (1) memory of prior actions/outcomes, (2) the current plan, (3) current system state and anomalies.
+- Detect -> diagnose -> COMMIT -> fix -> restore. Do not re-investigate once you have enough signal.
+- Fix root causes before symptoms. Dependencies: infrastructure -> database -> application.
 - NEVER repeat completed or failed actions.
 - NEVER use observability actions.
-- Update your plan if actions fail or new information emerges.
+- Keep the plan stable unless a failure, stagnation, or new critical information forces a revision.
+- reasoning MUST explicitly reference prior outcomes or observed state (not generic text).
 
 Return ONLY JSON:
-{{"analysis": "<situation assessment>", "plan": ["action1", "action2", ...], "next_action": "<action_name>", "target_agent": "<AgentName>", "reasoning": "<why this action next>"}}"""
+{{"analysis": "<situation assessment grounded in state+memory>", "plan": ["action1", "action2", ...], "next_action": "<action_name>", "target_agent": "<AgentName>", "reasoning": "<why this action next, citing memory/state>"}}"""
 
 
-def _parse_planning_response(text, available_actions, action_domains, memory, obs_actions, env):
+def _parse_planning_response(text, available_actions, action_domains, memory, obs_actions, env, strategy=None):
     data = _extract_json(text)
+    invalid_reason = "no_json"
     if data:
         plan = data.get("plan", [])
         action = data.get("next_action", "")
         valid_plan = [a for a in plan if a in available_actions and a not in memory.completed_actions and a not in obs_actions]
-        if action in obs_actions or action in memory.completed_actions:
-            action = ""
-        if action and action in available_actions:
-            correct_agent = _agent_for_action(action, action_domains)
-            if correct_agent:
-                return {"action": action, "target_agent": correct_agent, "plan": valid_plan,
-                        "analysis": data.get("analysis", ""), "reasoning": data.get("reasoning", ""),
-                        "llm_decided": True}
-        if valid_plan:
-            for pa in valid_plan:
-                if pa not in memory.completed_actions and pa not in obs_actions:
-                    agent = _agent_for_action(pa, action_domains)
-                    if agent:
-                        return {"action": pa, "target_agent": agent, "plan": valid_plan,
-                                "analysis": data.get("analysis", ""), "reasoning": "from_plan",
-                                "llm_decided": True}
+
+        def _violates_phase(a):
+            if strategy is None:
+                return False
+            if not strategy.allow_investigation() and StrategyTracker._is_investigation(a):
+                return True
+            return False
+
+        if action:
+            if action in obs_actions:
+                invalid_reason = "obs_action"
+            elif action in memory.completed_actions:
+                invalid_reason = "repeat_completed"
+            elif action in memory.failed_actions:
+                invalid_reason = "repeat_failed"
+            elif action not in available_actions:
+                invalid_reason = "unknown_action"
+            elif _violates_phase(action):
+                invalid_reason = "phase_violation"
+            else:
+                correct_agent = _agent_for_action(action, action_domains)
+                if correct_agent:
+                    return {"action": action, "target_agent": correct_agent, "plan": valid_plan,
+                            "analysis": data.get("analysis", ""), "reasoning": data.get("reasoning", ""),
+                            "llm_decided": True, "invalid_reason": ""}
+                invalid_reason = "no_agent"
+
+        for pa in valid_plan:
+            if pa in memory.completed_actions or pa in obs_actions or pa in memory.failed_actions:
+                continue
+            if _violates_phase(pa):
+                continue
+            agent = _agent_for_action(pa, action_domains)
+            if agent:
+                return {"action": pa, "target_agent": agent, "plan": valid_plan,
+                        "analysis": data.get("analysis", ""), "reasoning": "from_llm_plan",
+                        "llm_decided": True, "invalid_reason": ""}
 
     fa, ag = _state_aware_select(env, available_actions, memory, obs_actions, action_domains)
-    if fa:
-        return {"action": fa, "target_agent": ag, "plan": [], "analysis": "", "reasoning": "state_aware_fallback", "llm_decided": False}
+    if fa and (strategy is None or not (not strategy.allow_investigation() and StrategyTracker._is_investigation(fa))):
+        return {"action": fa, "target_agent": ag, "plan": [], "analysis": "", "reasoning": "safety_fallback_state_aware", "llm_decided": False, "invalid_reason": invalid_reason}
 
     for action in available_actions:
-        if action not in memory.completed_actions and action not in obs_actions:
-            agent = _agent_for_action(action, action_domains)
-            if agent:
-                return {"action": action, "target_agent": agent, "plan": [], "analysis": "", "reasoning": "last_resort", "llm_decided": False}
+        if action in memory.completed_actions or action in obs_actions:
+            continue
+        if strategy is not None and not strategy.allow_investigation() and StrategyTracker._is_investigation(action):
+            continue
+        agent = _agent_for_action(action, action_domains)
+        if agent:
+            return {"action": action, "target_agent": agent, "plan": [], "analysis": "", "reasoning": "safety_fallback_last_resort", "llm_decided": False, "invalid_reason": invalid_reason}
 
-    return {"action": "do_nothing", "target_agent": "AppOps", "plan": [], "analysis": "", "reasoning": "exhausted", "llm_decided": False}
+    return {"action": "do_nothing", "target_agent": "AppOps", "plan": [], "analysis": "", "reasoning": "exhausted", "llm_decided": False, "invalid_reason": invalid_reason}
 
 
 def _run_episode_core(room):
@@ -388,6 +530,7 @@ def _run_episode_core(room):
 
     memory = AgentMemory()
     planner = PlanTracker()
+    strategy = StrategyTracker()
 
     system_state = room.env.state_data["state"]
     obs_prompt = build_observability_prompt(system_state, root_cause_keywords, description)
@@ -399,6 +542,7 @@ def _run_episode_core(room):
     else:
         obs_msg = f"[ROOT CAUSE] Detected anomalies involving: {', '.join(root_cause_keywords)}"
         memory.root_cause_analysis = f"Anomalies involving: {', '.join(root_cause_keywords)}"
+    strategy.seed_from_observability(obs_data, root_cause_keywords, system_state)
     room.observe_and_communicate("ObservabilityOps", obs_msg)
 
     rewards_list = []
@@ -416,11 +560,12 @@ def _run_episode_core(room):
             system_state, playbook_text, memory, planner,
             action_domains, obs_actions, step + 1, goal_state,
             progress, description, available_actions, suggested_order,
+            strategy,
         )
 
         llm_text = call_llm(prompt, max_tokens=400)
         decision = _parse_planning_response(
-            llm_text, available_actions, action_domains, memory, obs_actions, room.env
+            llm_text, available_actions, action_domains, memory, obs_actions, room.env, strategy
         )
 
         action_str = decision["action"]
@@ -429,11 +574,13 @@ def _run_episode_core(room):
         llm_decided = decision.get("llm_decided", False)
         analysis = decision.get("analysis", "")
         reasoning = decision.get("reasoning", "")
+        invalid_reason = decision.get("invalid_reason", "")
 
-        if new_plan:
-            planner.update(new_plan)
+        allow_revision = strategy.should_revise_plan(memory)
+        planner.maybe_update(new_plan, allow_revision)
 
-        print(f"[PLAN] step={step+1} revision={planner.revision_count} plan={planner.current_plan} llm={llm_decided}")
+        print(f"[PLAN] step={step+1} revision={planner.revision_count} plan={planner.current_plan} llm={llm_decided} invalid={invalid_reason or 'none'}")
+        print(f"[STRATEGY] phase={strategy.phase} confidence={strategy.confidence:.2f} investigations={strategy.investigation_count}/{StrategyTracker.INVESTIGATION_LIMIT}")
         if analysis:
             print(f"[ANALYSIS] {analysis[:200]}")
         if reasoning:
@@ -457,6 +604,7 @@ def _run_episode_core(room):
         new_state = room.env.state_data["state"]
         memory.record(step + 1, action_str, target_agent, reward_val, prev_state, new_state)
         planner.mark_done(action_str)
+        strategy.record_step(action_str, reward_val, new_state.get("discovered", {}))
 
         error_msg = room.env.last_action_error or "null"
         print(
