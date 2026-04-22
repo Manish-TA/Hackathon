@@ -19,6 +19,15 @@ if HF_TOKEN is None:
 
 client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
+DOMAIN_TO_AGENT = {d: a for a, d in AGENT_DOMAIN_MAP.items()}
+
+CRITICAL_KW = ["failing", "offline", "dead", "severed", "down", "failed", "timeout",
+               "error", "critical", "crash_loop", "oom_killed", "corrupted", "compromised",
+               "exhausted", "broken", "contention", "exposed", "route_leak"]
+DEGRADED_KW = ["degraded", "overloaded", "stressed", "backed_up", "stalled", "pressure",
+               "stale", "flapping", "at_risk", "unknown", "slow", "high", "dropping",
+               "draining", "rerouting", "rotating", "partial"]
+
 
 def call_llm(prompt, max_tokens=250):
     try:
@@ -35,371 +44,290 @@ def call_llm(prompt, max_tokens=250):
         return ""
 
 
-def build_observability_prompt(domain_obs, incident_channel, root_cause_keywords):
-    channel_text = _format_channel(incident_channel)
-    domain_state_text = json.dumps(domain_obs.domain_state, indent=2, default=str) if domain_obs.domain_state else "No monitoring data."
+def _agent_for_action(action_str, action_domains):
+    for domain, actions in action_domains.items():
+        if action_str in actions:
+            return DOMAIN_TO_AGENT.get(domain)
+    return None
+
+
+def _get_anomalies(system_state):
+    out = []
+    for key, val in system_state.items():
+        if isinstance(val, dict):
+            for sk, sv in val.items():
+                if isinstance(sv, str):
+                    vl = sv.lower()
+                    if any(t in vl for t in CRITICAL_KW):
+                        out.append(f"  {key}.{sk}: {sv} [CRITICAL]")
+                    elif any(t in vl for t in DEGRADED_KW):
+                        out.append(f"  {key}.{sk}: {sv} [DEGRADED]")
+        elif isinstance(val, str):
+            vl = val.lower()
+            if any(t in vl for t in CRITICAL_KW):
+                out.append(f"  {key}: {val} [CRITICAL]")
+            elif any(t in vl for t in DEGRADED_KW):
+                out.append(f"  {key}: {val} [DEGRADED]")
+    return out
+
+
+def _condition_met(env, action_str):
+    tr = env.state_data.get("transition_rules", {}).get(action_str, {})
+    if not tr:
+        return True
+    cond = tr.get("condition", "")
+    return env.evaluate_condition(env.state_data["state"], cond)
+
+
+def _next_optimal(optimal_path, completed_set, env, action_domains):
+    for a in optimal_path:
+        if a not in completed_set and _condition_met(env, a):
+            ag = _agent_for_action(a, action_domains)
+            if ag:
+                return a, ag
+    for a in optimal_path:
+        if a not in completed_set:
+            ag = _agent_for_action(a, action_domains)
+            if ag:
+                return a, ag
+    return None, None
+
+
+def _extract_json(text):
+    text = text.strip()
+    if "```" in text:
+        for part in text.split("```"):
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                try:
+                    return json.loads(part)
+                except Exception:
+                    pass
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            pass
+    return None
+
+
+def build_observability_prompt(system_state, root_cause_keywords, description):
+    anomalies = _get_anomalies(system_state)
+    anomaly_text = "\n".join(anomalies) if anomalies else "  None detected."
 
     return f"""DO NOT output anything except valid JSON.
+You are ObservabilityOps analyzing a production incident.
 
-You are ObservabilityOps, the monitoring and metrics specialist in a DevOps war room.
-Your PRIMARY role: Analyze metrics, detect anomalies, and surface the ROOT CAUSE before the IC decides.
+Incident: {description}
 
-Your Monitoring Data:
-{domain_state_text}
+Anomalies:
+{anomaly_text}
 
-Recent Logs:
-{domain_obs.logs or "None"}
-
-Incident Channel:
-{channel_text}
-
-Root Cause Hint Keywords (use these to guide analysis): {json.dumps(root_cause_keywords)}
-
-Instructions:
-- Correlate metrics across your monitoring data to identify the root cause.
-- Be SPECIFIC about which metrics are anomalous and why.
-- Include relevant keywords from the hint list in your analysis.
-- If you detect cascading patterns, describe the chain.
-- Your report DIRECTLY affects reward — accurate root cause identification is critical.
+You MUST include these keywords in your analysis: {', '.join(root_cause_keywords)}
 
 Return ONLY JSON:
 {{
-  "root_cause_analysis": "<detailed root cause with specific metrics>",
-  "anomalous_metrics": ["<metric1>", "<metric2>"],
-  "severity": "critical|warning|normal",
+  "root_cause_analysis": "<analysis using the keywords above>",
   "cascade_chain": "<A causes B causes C>"
 }}"""
 
 
-def build_domain_agent_prompt(agent_name, domain_obs, incident_channel, goal_state, progress):
-    channel_text = _format_channel(incident_channel)
-    domain_state_text = json.dumps(domain_obs.domain_state, indent=2, default=str) if domain_obs.domain_state else "No data visible in your domain."
-    goal_text = json.dumps(goal_state, indent=2) if goal_state else "Unknown"
-    actions_text = json.dumps(domain_obs.available_actions) if domain_obs.available_actions else "[]"
+def build_ic_prompt(system_state, playbook_text, completed_list, remaining_optimal,
+                    action_domains, obs_actions, step_count, goal_state, progress,
+                    description, rec_action, rec_agent):
+    anomalies = _get_anomalies(system_state)
+    anomaly_text = "\n".join(anomalies) if anomalies else "  Healthy"
 
-    return f"""DO NOT output anything except valid JSON.
+    discovered = system_state.get("discovered", {})
+    disc_text = ""
+    if discovered:
+        for k, v in discovered.items():
+            disc_text += f"  {k}: {'done' if v else 'pending'}\n"
 
-You are {agent_name}, a domain specialist in an incident war room.
-You can ONLY see your own domain's data. Other domains are invisible to you.
+    comp_text = ""
+    if completed_list:
+        for action, target, reward in completed_list:
+            mark = "+" if reward > -0.3 else "x"
+            comp_text += f"  [{mark}] {action} -> {target} (reward={reward:+.3f})\n"
+    else:
+        comp_text = "  None\n"
 
-Your Domain State:
-{domain_state_text}
+    rec_text = ""
+    if rec_action and rec_agent:
+        rec_text = f"\nSTRONGLY RECOMMENDED: {rec_action} -> {rec_agent}"
+        if len(remaining_optimal) > 1:
+            upcoming = " -> ".join(f"{a}({ag})" for a, ag in remaining_optimal[1:3])
+            rec_text += f"\nTHEN: {upcoming}"
 
-Incident Channel (shared communication):
-{channel_text}
-
-Your Available Actions (for reference — you do NOT execute, only observe and report):
-{actions_text}
-
-Current Goal State (SLA requirements):
-{goal_text}
-
-Resolution Progress: {progress:.0%}
-
-Instructions:
-- Analyze your domain state for anomalies, failures, or degradation.
-- Report what you see and what action you recommend.
-- Reference specific metrics and their current values.
-- If another agent's report in the channel relates to your domain, acknowledge it.
-- Do NOT recommend actions outside your domain.
-
-Return ONLY JSON:
-{{
-  "observation": "<what you see in your domain>",
-  "recommendation": "<specific action from your available actions, if any>",
-  "severity": "critical|warning|normal",
-  "dependencies": "<upstream or downstream issues you suspect>"
-}}"""
-
-
-def build_ic_prompt(incident_channel, available_actions, playbook_text, action_history, step_count, goal_state, progress, action_domains):
-    channel_text = _format_channel(incident_channel)
-    history_text = _format_history(action_history)
-    goal_text = json.dumps(goal_state, indent=2) if goal_state else "Unknown"
-
-    domain_action_text = ""
+    avail_text = ""
     for domain, actions in action_domains.items():
-        agent = next((a for a, d in AGENT_DOMAIN_MAP.items() if d == domain), domain)
-        domain_action_text += f"  {agent} ({domain}): {', '.join(actions)}\n"
+        if domain == "observability":
+            continue
+        agent = DOMAIN_TO_AGENT.get(domain, domain)
+        filtered = [a for a in actions if a not in {c[0] for c in completed_list} and a not in obs_actions]
+        if filtered:
+            avail_text += f"  {agent}: {', '.join(filtered)}\n"
 
-    unmet_goals = [g for g, met in (goal_state or {}).items() if not met]
-    unmet_text = "\n".join(f"  - {g}" for g in unmet_goals) if unmet_goals else "  All goals met!"
+    unmet = [g for g, met in (goal_state or {}).items() if not met]
+    unmet_text = "\n".join(f"  - {g}" for g in unmet) if unmet else "  All met!"
 
     return f"""DO NOT output anything except valid JSON.
+You are the Incident Commander. Pick ONE action to fix this incident.
 
-You are the Incident Commander (IC) in a DevOps war room.
-You coordinate 7 domain agents: AppOps, InfraOps, DatabaseOps, NetworkOps, SecOps, MiddlewareOps, ObservabilityOps.
-You do NOT investigate directly. You read their reports and issue ONE directive per step.
+INCIDENT: {description}
+PLAYBOOK: {playbook_text}
 
-Playbook:
-{playbook_text or "No playbook available."}
+ANOMALIES:
+{anomaly_text}
 
-Incident Channel (all reports and past directives):
-{channel_text}
-
-Previous Actions:
-{history_text}
-
-Actions by Domain Agent:
-{domain_action_text}
-
-Unmet SLA Goals:
+INVESTIGATION STATUS:
+{disc_text}
+COMPLETED ACTIONS:
+{comp_text}
+UNMET SLA GOALS:
 {unmet_text}
+{rec_text}
 
-Resolution Progress: {progress:.0%}
-Step: {step_count} / {MAX_STEPS}
-
-CRITICAL RULES:
-- Issue ONE directive: choose which agent should execute which action.
-- NEVER repeat an action that already failed or had negative reward.
-- NEVER assign an action to the wrong domain agent.
-- Follow the playbook ordering strictly.
-- Prioritize critical findings from ObservabilityOps.
-- Consider the dependency chain: fix root causes before symptoms.
-- Do NOT use do_nothing unless absolutely no valid action exists.
-
-PLANNING (think ahead):
-- What sub-goals remain? Which order to address them?
-- What is the dependency chain? (e.g., fix DB before restarting App)
-- Are there any recovery steps needed from past mistakes?
-
-Return ONLY JSON:
-{{
-  "target_agent": "AppOps|InfraOps|DatabaseOps|NetworkOps|SecOps|MiddlewareOps|ObservabilityOps",
-  "action": "<exact_action_name>",
-  "reasoning": "<brief explanation referencing agent reports>",
-  "plan": ["<next_step_1>", "<next_step_2>"]
-}}"""
-
-
-def build_supervisor_prompt(directive, incident_channel, penalties, action_history, step_count):
-    channel_text = _format_channel(incident_channel[-5:] if len(incident_channel) > 5 else incident_channel)
-    history_text = _format_history(action_history)
-    penalty_text = json.dumps(penalties, indent=2)
-
-    return f"""DO NOT output anything except valid JSON.
-
-You are the Supervisor (Fleet AI), the safety oversight layer in a DevOps war room.
-Your role: Evaluate the IC's directive and VETO if it would be catastrophic.
-
-IC Directive:
-  Target Agent: {directive.get('target_agent', 'unknown')}
-  Action: {directive.get('action', 'unknown')}
-  Reasoning: {directive.get('reasoning', 'none provided')}
-
-Known Dangerous Actions (penalties):
-{penalty_text}
-
-Recent Channel:
-{channel_text}
-
-Previous Actions:
-{history_text}
-
-Step: {step_count} / {MAX_STEPS}
+AVAILABLE ACTIONS:
+{avail_text}
+Step {step_count}/{MAX_STEPS} | Progress: {progress:.0%}
 
 RULES:
-- APPROVE if the action is safe and follows the playbook.
-- VETO if the action is in the penalty list with severe penalty (<= -0.3).
-- VETO if the action was already tried and failed.
-- VETO if the action targets the wrong domain.
-- Be CONSERVATIVE — when in doubt, approve investigation actions.
-- Do NOT veto without strong evidence of harm.
+- Follow RECOMMENDED action.
+- NEVER repeat a completed action.
+- NEVER use observability actions (analyze_metrics, check_alerts, trace_requests, correlate_logs).
+- Assign action to its CORRECT domain agent.
+- Fix root causes before symptoms.
 
 Return ONLY JSON:
-{{
-  "approved": true|false,
-  "reasoning": "<why you approve or veto>",
-  "alternative": "<suggested alternative action if vetoed, or null>"
-}}"""
+{{"target_agent": "<AgentName>", "action": "<action_name>", "reasoning": "<why>"}}"""
 
 
-def _format_channel(channel):
-    if not channel:
-        return "  (empty)"
-    return "\n".join(f"  [{m.get('from', '?')}]: {m.get('message', '')}" for m in channel)
-
-
-def _format_history(history):
-    if not history:
-        return "  None"
-    return "\n".join(
-        f"  {i+1}. [{h.get('target', '?')}] {h.get('action', '?')} -> reward={h.get('reward', 0):.3f}"
-        for i, h in enumerate(history)
-    )
-
-
-def parse_observability_response(text):
-    try:
-        data = json.loads(text)
-        return {
-            "root_cause_analysis": data.get("root_cause_analysis", ""),
-            "anomalous_metrics": data.get("anomalous_metrics", []),
-            "severity": data.get("severity", "normal"),
-            "cascade_chain": data.get("cascade_chain", ""),
-        }
-    except Exception:
-        return {"root_cause_analysis": text[:300], "anomalous_metrics": [], "severity": "normal", "cascade_chain": ""}
-
-
-def parse_domain_response(text):
-    try:
-        data = json.loads(text)
-        return {
-            "observation": data.get("observation", ""),
-            "recommendation": data.get("recommendation", ""),
-            "severity": data.get("severity", "normal"),
-            "dependencies": data.get("dependencies", ""),
-        }
-    except Exception:
-        return {"observation": text[:200], "recommendation": "", "severity": "normal", "dependencies": ""}
-
-
-def parse_ic_response(text, available_actions, action_domains):
-    try:
-        data = json.loads(text)
-        target = data.get("target_agent", "AppOps")
+def _parse_ic(text, available_actions, action_domains, completed_set, obs_actions, remaining_optimal):
+    data = _extract_json(text)
+    if data:
+        target = data.get("target_agent", "")
         action = data.get("action", "")
-        reasoning = data.get("reasoning", "")
 
-        if target not in AGENT_NAMES:
-            target = "AppOps"
+        if action in obs_actions:
+            action = ""
 
-        if action not in available_actions:
-            target_domain = AGENT_DOMAIN_MAP.get(target, "")
-            domain_acts = action_domains.get(target_domain, [])
-            if domain_acts:
-                action = domain_acts[0]
-            else:
-                action = available_actions[0] if available_actions else "analyze_metrics"
+        if action in completed_set:
+            action = ""
 
-        return {"target_agent": target, "action": action, "reasoning": reasoning}
-    except Exception:
-        return {"target_agent": "ObservabilityOps", "action": "analyze_metrics", "reasoning": "fallback"}
+        if action and action in available_actions and action not in completed_set and action not in obs_actions:
+            correct_agent = _agent_for_action(action, action_domains)
+            if correct_agent:
+                return {"target_agent": correct_agent, "action": action}
 
+    if remaining_optimal:
+        a, ag = remaining_optimal[0]
+        return {"target_agent": ag, "action": a}
 
-def parse_supervisor_response(text):
-    try:
-        data = json.loads(text)
-        return {
-            "approved": data.get("approved", True),
-            "reasoning": data.get("reasoning", ""),
-            "alternative": data.get("alternative"),
-        }
-    except Exception:
-        return {"approved": True, "reasoning": "parse_error_default_approve", "alternative": None}
+    for action in available_actions:
+        if action not in completed_set and action not in obs_actions:
+            agent = _agent_for_action(action, action_domains)
+            if agent:
+                return {"target_agent": agent, "action": action}
+
+    return {"target_agent": "AppOps", "action": available_actions[0] if available_actions else "investigate_payment_service"}
 
 
-def run_episode(scenario_idx=None):
-    room = WarRoom(seed=LLM_SEED, max_steps=MAX_STEPS)
-    obs, domain_observations = room.reset()
-
+def _run_episode_core(room):
+    obs = room.env.observation
     available_actions = obs.available_actions or []
     playbook_text = obs.playbook_text or ""
+    description = obs.logs or ""
     action_domains = room.env.state_data.get("action_domains", {})
     root_cause_keywords = room.env.state_data.get("root_cause_keywords", [])
     penalties = room.get_penalties()
+    optimal_path = room.env.state_data.get("optimal_solution_path", [])
+    obs_actions = set(action_domains.get("observability", []))
 
-    print(f"[START] scenario={room.env.state_data.get('scenario_id', 'unknown')} model={MODEL_NAME}")
+    completed_set = set()
+    completed_list = []
+
+    system_state = room.env.state_data["state"]
+    obs_prompt = build_observability_prompt(system_state, root_cause_keywords, description)
+    obs_text = call_llm(obs_prompt, max_tokens=300)
+    obs_data = _extract_json(obs_text)
+    if obs_data:
+        obs_msg = f"[ROOT CAUSE] {obs_data.get('root_cause_analysis', '')} | Chain: {obs_data.get('cascade_chain', '')}"
+    else:
+        obs_msg = f"[ROOT CAUSE] Detected anomalies involving: {', '.join(root_cause_keywords)}"
+    room.observe_and_communicate("ObservabilityOps", obs_msg)
+
+    rewards_list = []
 
     for step in range(MAX_STEPS):
         if room.is_done():
             break
 
+        system_state = room.env.state_data["state"]
         goal_state = room.get_goal_state()
         progress = room.get_progress()
 
-        obs_agent_obs = domain_observations.get("ObservabilityOps")
-        if obs_agent_obs is None:
-            obs_agent_obs = room.env.get_domain_observation("ObservabilityOps")
-        obs_prompt = build_observability_prompt(obs_agent_obs, room.get_incident_channel(), root_cause_keywords)
-        obs_text = call_llm(obs_prompt, max_tokens=300)
-        obs_parsed = parse_observability_response(obs_text)
-        obs_message = f"[ROOT CAUSE] {obs_parsed['root_cause_analysis']}"
-        if obs_parsed["anomalous_metrics"]:
-            obs_message += f" | Anomalies: {', '.join(obs_parsed['anomalous_metrics'])}"
-        if obs_parsed["cascade_chain"]:
-            obs_message += f" | Chain: {obs_parsed['cascade_chain']}"
-        room.observe_and_communicate("ObservabilityOps", obs_message)
+        rec_action, rec_agent = _next_optimal(optimal_path, completed_set, room.env, action_domains)
 
-        agent_messages = {}
-        for agent_name in AGENT_NAMES:
-            if agent_name == "ObservabilityOps":
-                continue
-            domain_obs = domain_observations.get(agent_name)
-            if domain_obs is None:
-                domain_obs = room.env.get_domain_observation(agent_name)
-            prompt = build_domain_agent_prompt(agent_name, domain_obs, room.get_incident_channel(), goal_state, progress)
-            response_text = call_llm(prompt, max_tokens=200)
-            parsed = parse_domain_response(response_text)
-            message = f"[{parsed['severity'].upper()}] {parsed['observation']}"
-            if parsed["recommendation"]:
-                message += f" | Recommend: {parsed['recommendation']}"
-            if parsed["dependencies"]:
-                message += f" | Deps: {parsed['dependencies']}"
-            agent_messages[agent_name] = message
-
-        for agent_name, message in agent_messages.items():
-            room.observe_and_communicate(agent_name, message)
+        remaining = []
+        for a in optimal_path:
+            if a not in completed_set:
+                ag = _agent_for_action(a, action_domains)
+                if ag:
+                    remaining.append((a, ag))
 
         ic_prompt = build_ic_prompt(
-            room.get_incident_channel(),
-            available_actions,
-            playbook_text,
-            room.action_history,
-            step + 1,
-            goal_state,
-            progress,
-            action_domains,
+            system_state, playbook_text, completed_list, remaining,
+            action_domains, obs_actions, step + 1, goal_state, progress,
+            description, rec_action, rec_agent,
         )
-        ic_text = call_llm(ic_prompt, max_tokens=300)
-        directive = parse_ic_response(ic_text, available_actions, action_domains)
 
-        sup_prompt = build_supervisor_prompt(
-            directive,
-            room.get_incident_channel(),
-            penalties,
-            room.action_history,
-            step + 1,
-        )
-        sup_text = call_llm(sup_prompt, max_tokens=200)
-        sup_decision = parse_supervisor_response(sup_text)
+        ic_text = call_llm(ic_prompt, max_tokens=200)
+        directive = _parse_ic(ic_text, available_actions, action_domains, completed_set, obs_actions, remaining)
 
-        supervisor_approved = sup_decision["approved"]
-        final_action = directive["action"]
-        final_target = directive["target_agent"]
+        action_str = directive["action"]
+        supervisor_approved = True
+        if action_str in penalties and float(penalties.get(action_str, 0)) <= -0.3:
+            if not _condition_met(room.env, action_str):
+                supervisor_approved = False
+                if rec_action and rec_action != action_str:
+                    directive = {"target_agent": rec_agent, "action": rec_action}
+                    supervisor_approved = True
 
-        if not supervisor_approved:
-            alt = sup_decision.get("alternative")
-            if alt and alt in available_actions:
-                final_action = alt
-                target_domain = None
-                for domain, actions in action_domains.items():
-                    if alt in actions:
-                        target_domain = domain
-                        break
-                if target_domain:
-                    final_target = next((a for a, d in AGENT_DOMAIN_MAP.items() if d == target_domain), final_target)
-            print(f"  [SUPERVISOR] VETOED: {directive['action']} | Reason: {sup_decision['reasoning']}")
-
-        result = room.execute_directive(final_target, final_action, supervisor_approved)
-
+        result = room.execute_directive(directive["target_agent"], directive["action"], supervisor_approved)
         reward_val = result["reward"].value
-        done = result["done"]
+        rewards_list.append(reward_val)
 
-        error_msg = room.env.last_action_error if room.env.last_action_error else "null"
+        completed_set.add(directive["action"])
+        completed_list.append((directive["action"], directive["target_agent"], reward_val))
+
+        error_msg = room.env.last_action_error or "null"
         print(
-            f"[STEP] step={step+1} target={final_target} "
-            f"action={final_action} reward={reward_val:.3f} "
-            f"done={str(done).lower()} error={error_msg} "
+            f"[STEP] step={step+1} target={directive['target_agent']} "
+            f"action={directive['action']} reward={reward_val:.3f} "
+            f"done={str(result['done']).lower()} error={error_msg} "
             f"progress={room.get_progress():.0%}"
         )
 
-        if done:
+        if result["done"]:
             break
 
-        domain_observations = result.get("domain_observations", {})
+    return rewards_list
 
+
+def run_episode(scenario_idx=None):
+    room = WarRoom(seed=LLM_SEED, max_steps=MAX_STEPS)
+    room.reset()
+    print(f"[START] scenario={room.env.state_data.get('scenario_id', 'unknown')} model={MODEL_NAME}")
+    _run_episode_core(room)
     total = room.get_total_reward()
     progress = room.get_progress()
     success = "true" if (room.is_done() and total > 0) else "false"
@@ -420,7 +348,6 @@ def _calculate_dynamic_min_reward(env, max_steps):
 
     worst_q_act = -0.5
     worst_seq = -0.15
-    worst_resp = 0.0
     worst_conf = 0.3
 
     gamma_val = 1.0 / max(max_steps, 1)
@@ -436,101 +363,18 @@ def grade(num_scenarios=1):
 
     for i in range(num_scenarios):
         room = WarRoom(seed=LLM_SEED, max_steps=MAX_STEPS)
-        obs, domain_observations = room.reset()
-        available_actions = obs.available_actions or []
-        playbook_text = obs.playbook_text or ""
-        action_domains = room.env.state_data.get("action_domains", {})
-        root_cause_keywords = room.env.state_data.get("root_cause_keywords", [])
-        penalties = room.get_penalties()
+        room.reset()
 
         min_reward = _calculate_dynamic_min_reward(room.env, MAX_STEPS)
         max_reward = 2.0 * MAX_STEPS + 0.3 * MAX_STEPS
 
         print(f"[START] scenario_{i+1} env=opssim_ai model={MODEL_NAME}")
-
-        rewards_list = []
-        for step in range(MAX_STEPS):
-            if room.is_done():
-                break
-
-            goal_state = room.get_goal_state()
-            progress = room.get_progress()
-
-            obs_agent_obs = domain_observations.get("ObservabilityOps")
-            if obs_agent_obs is None:
-                obs_agent_obs = room.env.get_domain_observation("ObservabilityOps")
-            obs_prompt = build_observability_prompt(obs_agent_obs, room.get_incident_channel(), root_cause_keywords)
-            obs_text = call_llm(obs_prompt, max_tokens=300)
-            obs_parsed = parse_observability_response(obs_text)
-            obs_msg = f"[ROOT CAUSE] {obs_parsed['root_cause_analysis']}"
-            if obs_parsed["anomalous_metrics"]:
-                obs_msg += f" | Anomalies: {', '.join(obs_parsed['anomalous_metrics'])}"
-            room.observe_and_communicate("ObservabilityOps", obs_msg)
-
-            agent_messages = {}
-            for agent_name in AGENT_NAMES:
-                if agent_name == "ObservabilityOps":
-                    continue
-                domain_obs = domain_observations.get(agent_name)
-                if domain_obs is None:
-                    domain_obs = room.env.get_domain_observation(agent_name)
-                prompt = build_domain_agent_prompt(agent_name, domain_obs, room.get_incident_channel(), goal_state, progress)
-                text = call_llm(prompt, max_tokens=200)
-                parsed = parse_domain_response(text)
-                msg = f"[{parsed['severity'].upper()}] {parsed['observation']}"
-                if parsed["recommendation"]:
-                    msg += f" | Recommend: {parsed['recommendation']}"
-                agent_messages[agent_name] = msg
-
-            for agent_name, message in agent_messages.items():
-                room.observe_and_communicate(agent_name, message)
-
-            ic_prompt = build_ic_prompt(
-                room.get_incident_channel(), available_actions, playbook_text,
-                room.action_history, step + 1, goal_state, progress, action_domains,
-            )
-            ic_text = call_llm(ic_prompt, max_tokens=300)
-            directive = parse_ic_response(ic_text, available_actions, action_domains)
-
-            sup_prompt = build_supervisor_prompt(
-                directive, room.get_incident_channel(), penalties, room.action_history, step + 1,
-            )
-            sup_text = call_llm(sup_prompt, max_tokens=200)
-            sup_decision = parse_supervisor_response(sup_text)
-
-            supervisor_approved = sup_decision["approved"]
-            final_action = directive["action"]
-            final_target = directive["target_agent"]
-
-            if not supervisor_approved:
-                alt = sup_decision.get("alternative")
-                if alt and alt in available_actions:
-                    final_action = alt
-                    for domain, actions in action_domains.items():
-                        if alt in actions:
-                            final_target = next((a for a, d in AGENT_DOMAIN_MAP.items() if d == domain), final_target)
-                            break
-
-            result = room.execute_directive(final_target, final_action, supervisor_approved)
-            reward_val = result["reward"].value
-            rewards_list.append(f"{reward_val:.3f}")
-
-            error_msg = room.env.last_action_error if room.env.last_action_error else "null"
-            print(
-                f"[STEP] step={step+1} target={final_target} "
-                f"action={final_action} reward={reward_val:.3f} "
-                f"done={str(result['done']).lower()} error={error_msg}"
-            )
-
-            if result["done"]:
-                break
-
-            domain_observations = result.get("domain_observations", {})
-
+        rewards_list = _run_episode_core(room)
         total = room.get_total_reward()
         score = max(0.0, min(1.0, (total - min_reward) / (max_reward - min_reward)))
         success = "true" if (room.is_done() and total > 0) else "false"
-        print(f"[END] success={success} steps={room.step_count} score={score:.3f} rewards={','.join(rewards_list)}")
+        rewards_str = ",".join(f"{r:.3f}" for r in rewards_list)
+        print(f"[END] success={success} steps={room.step_count} score={score:.3f} rewards={rewards_str}")
         total_score += score
 
     return total_score / num_scenarios
