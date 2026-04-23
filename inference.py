@@ -542,6 +542,11 @@ def _run_episode_core(room):
     else:
         obs_msg = f"[ROOT CAUSE] Detected anomalies involving: {', '.join(root_cause_keywords)}"
         memory.root_cause_analysis = f"Anomalies involving: {', '.join(root_cause_keywords)}"
+    if root_cause_keywords:
+        lower = obs_msg.lower()
+        missing = [k for k in root_cause_keywords if k.lower() not in lower]
+        if missing:
+            obs_msg = obs_msg + " | keywords: " + ", ".join(root_cause_keywords)
     room.observe_and_communicate("ObservabilityOps", obs_msg)
 
     rewards_list = []
@@ -608,6 +613,10 @@ def _run_episode_core(room):
         memory.record(step + 1, action_str, target_agent, reward_val, prev_state, new_state)
         planner.mark_done(action_str)
         strategy.record_step(action_str, reward_val, new_state.get("discovered", {}))
+
+        if root_cause_keywords and memory.is_stagnating():
+            repost = "[OBS UPDATE] Re-confirming keywords: " + ", ".join(root_cause_keywords)
+            room.observe_and_communicate("ObservabilityOps", repost)
 
         error_msg = room.env.last_action_error or "null"
         print(
