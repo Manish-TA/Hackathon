@@ -13,6 +13,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
 MAX_STEPS = 15
 LLM_SEED = 42
+MAX_RETRIES = 3
 STAGNATION_WINDOW = 3
 
 if HF_TOKEN is None:
@@ -609,7 +610,7 @@ def _run_episode_core(room):
         last_invalid_reason = ""
         last_reward = rewards_list[-1] if rewards_list else None
 
-        while not valid:
+        while not valid and attempts < MAX_RETRIES:
             attempts += 1
             prompt = build_planning_prompt(
                 system_state, playbook_text, memory, planner,
@@ -629,16 +630,20 @@ def _run_episode_core(room):
             reward_note = f"last_step_reward={last_reward:+.3f}" if last_reward is not None else "no_prior_reward"
             failed_list = ", ".join(sorted(memory.failed_actions)) or "<none>"
             replan_feedback = (
-                f"PREVIOUS ATTEMPT REJECTED (attempt {attempts}). "
+                f"PREVIOUS ATTEMPT REJECTED (attempt {attempts}/{MAX_RETRIES}). "
                 f"Your chosen next_action '{chosen}' was invalid: {reason}. "
                 f"Constraint violated: must be a currently FEASIBLE action (preconditions satisfied), "
-                f"not completed, not previously failed, not an observability action. "
+                f"not completed, not previously failed, not an observability action, not unsafe. "
                 f"Banned/failed actions: {failed_list}. "
                 f"Current reward signal: {reward_note}. "
                 f"Re-read the [FEASIBLE NOW] list and choose ONE action from it. "
                 f"Reason step by step: detect -> identify root cause -> fix root cause -> restore dependents."
             )
-            print(f"[LLM-RETRY] step={step+1} attempt={attempts} rejected_action={chosen} reason={reason}")
+            print(f"[LLM-RETRY] step={step+1} attempt={attempts}/{MAX_RETRIES} rejected_action={chosen} reason={reason}")
+
+        if not valid:
+            print(f"[LLM-SKIP] step={step+1} retries exhausted reason={last_invalid_reason}. Skipping step (no action executed).")
+            continue
 
         llm_decided = True
         analysis = decision.get("analysis", "")
