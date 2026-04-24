@@ -13,7 +13,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
 MAX_STEPS = 15
 LLM_SEED = 42
-MAX_REPLANS_PER_STEP = 2
+MAX_LLM_RETRIES_PER_STEP = 3
 STAGNATION_WINDOW = 3
 
 if HF_TOKEN is None:
@@ -321,34 +321,6 @@ def _is_unsafe(env, action_str):
     return not _condition_met(env, action_str)
 
 
-def _safety_fallback(env, available_actions, memory, obs_actions, action_domains):
-    for action in available_actions:
-        if action in obs_actions:
-            continue
-        if action in memory.completed_actions:
-            continue
-        if action in memory.failed_actions:
-            continue
-        agent = _agent_for_action(action, action_domains)
-        if not agent:
-            continue
-        if not _is_feasible(env, action):
-            continue
-        return action, agent
-    for action in available_actions:
-        if action in obs_actions:
-            continue
-        if action in memory.completed_actions:
-            continue
-        agent = _agent_for_action(action, action_domains)
-        if not agent:
-            continue
-        if not _is_feasible(env, action):
-            continue
-        return action, agent
-    return None, None
-
-
 def build_observability_prompt(system_state, root_cause_keywords, description):
     anomalies = _get_anomalies(system_state)
     anomaly_text = "\n".join(anomalies) if anomalies else "  None detected."
@@ -559,19 +531,23 @@ def _build_feasibility_map(env, available_actions, obs_actions, memory, action_d
     return fmap
 
 
-def _pick_next_from_plan(env, plan, skip_action, memory, obs_actions, action_domains):
-    for pa in plan:
-        if pa == skip_action:
-            continue
-        if pa in memory.completed_actions or pa in memory.failed_actions or pa in obs_actions:
-            continue
-        agent = _agent_for_action(pa, action_domains)
-        if not agent:
-            continue
-        if not _is_feasible(env, pa):
-            continue
-        return pa, agent
-    return None, None
+def _validate_llm_decision(decision, env, memory, obs_actions):
+    if not decision.get("llm_decided"):
+        return False, decision.get("invalid_reason") or "llm_parse_failed"
+    action = decision.get("action", "")
+    if not action:
+        return False, "empty_action"
+    if action in obs_actions:
+        return False, "obs_action_not_allowed"
+    if action in memory.completed_actions:
+        return False, "already_completed"
+    if action in memory.failed_actions:
+        return False, "previously_failed"
+    if _is_unsafe(env, action):
+        return False, "unsafe_harmful_with_preconditions_not_met"
+    if not _is_feasible(env, action):
+        return False, "infeasible_preconditions_not_met"
+    return True, ""
 
 
 def _run_episode_core(room):
@@ -581,7 +557,6 @@ def _run_episode_core(room):
     description = obs.logs or ""
     action_domains = room.env.state_data.get("action_domains", {})
     root_cause_keywords = room.env.state_data.get("root_cause_keywords", [])
-    penalties = room.get_penalties()
     obs_actions = set(action_domains.get("observability", []))
     suggested_order = room.env.state_data.get("optimal_solution_path", [])
 
@@ -624,93 +599,56 @@ def _run_episode_core(room):
 
         decision = None
         replan_feedback = ""
-        replan_count = 0
-        action_str = ""
-        target_agent = ""
+        attempts = 0
+        valid = False
+        last_invalid_reason = ""
 
-        while True:
+        while attempts < MAX_LLM_RETRIES_PER_STEP:
+            attempts += 1
             prompt = build_planning_prompt(
                 system_state, playbook_text, memory, planner,
                 action_domains, obs_actions, step + 1, goal_state,
                 progress, description, available_actions, suggested_order,
                 strategy, feasibility_map, replan_feedback,
             )
-
             llm_text = call_llm(prompt, max_tokens=400)
             decision = _parse_planning_response(
                 llm_text, available_actions, action_domains, memory, obs_actions, room.env, strategy
             )
-
-            action_str = decision["action"]
-            target_agent = decision["target_agent"]
-
-            if not decision.get("llm_decided") or not action_str:
+            valid, reason = _validate_llm_decision(decision, room.env, memory, obs_actions)
+            if valid:
                 break
-
-            unsafe = _is_unsafe(room.env, action_str)
-            feasible = _is_feasible(room.env, action_str)
-
-            if feasible and not unsafe:
-                break
-
-            alt, alt_ag = _pick_next_from_plan(
-                room.env, decision.get("plan", []), action_str,
-                memory, obs_actions, action_domains,
+            last_invalid_reason = reason
+            chosen = decision.get("action", "") or "<none>"
+            replan_feedback = (
+                f"PREVIOUS ATTEMPT REJECTED. Your chosen next_action '{chosen}' was invalid: {reason}. "
+                f"Pick ONLY an action marked [FEASIBLE NOW] that is not in the banned/completed list. "
+                f"Think: what is the root cause, and what is the single next action whose preconditions are satisfied right now?"
             )
-            if alt:
-                decision["action"] = alt
-                decision["target_agent"] = alt_ag
-                decision["reasoning"] = "next_feasible_from_llm_plan"
-                action_str = alt
-                target_agent = alt_ag
-                break
+            print(f"[LLM-RETRY] step={step+1} attempt={attempts}/{MAX_LLM_RETRIES_PER_STEP} rejected_action={chosen} reason={reason}")
 
-            if replan_count >= MAX_REPLANS_PER_STEP:
-                break
-
-            reason = "UNSAFE (harmful penalty with preconditions not met)" if unsafe else "INFEASIBLE (preconditions not satisfied)"
-            replan_feedback = (f"Your chosen action '{action_str}' is {reason}. "
-                               f"Select a different action that is marked [FEASIBLE NOW]. "
-                               f"Fix the root cause and restore dependencies in the correct order.")
-            replan_count += 1
-
-        llm_decided = decision.get("llm_decided", False)
+        llm_decided = decision.get("llm_decided", False) and valid
         analysis = decision.get("analysis", "")
         reasoning = decision.get("reasoning", "")
-        invalid_reason = decision.get("invalid_reason", "")
+        invalid_reason = "" if valid else last_invalid_reason
         llm_confidence_raw = decision.get("confidence")
         new_plan = decision.get("plan", [])
 
-        need_fallback = False
-        if not action_str:
-            need_fallback = True
-        elif not _is_feasible(room.env, action_str):
-            need_fallback = True
-        elif _is_unsafe(room.env, action_str):
-            need_fallback = True
-
-        if need_fallback:
-            alt, alt_ag = _safety_fallback(
-                room.env, available_actions, memory, obs_actions, action_domains
-            )
-            if alt:
-                action_str = alt
-                target_agent = alt_ag
-                llm_decided = False
-                reasoning = f"safety_fallback({invalid_reason or 'infeasible'})"
-            else:
-                action_str = "do_nothing"
-                target_agent = "AppOps"
-                llm_decided = False
-                reasoning = "safety_fallback_exhausted"
+        if valid:
+            action_str = decision["action"]
+            target_agent = decision["target_agent"]
+        else:
+            action_str = "do_nothing"
+            target_agent = "AppOps"
+            reasoning = f"llm_failed_after_retries:{last_invalid_reason}"
 
         if llm_decided:
             strategy.ingest_llm_confidence(llm_confidence_raw, source="planner_llm")
 
-        allow_revision = strategy.should_revise_plan(memory) or memory.is_declining()
+        allow_revision = strategy.should_revise_plan(memory) or memory.is_declining() or not valid
         planner.maybe_update(new_plan, allow_revision)
 
-        print(f"[PLAN] step={step+1} revision={planner.revision_count} plan={planner.current_plan} llm={llm_decided} invalid={invalid_reason or 'none'} replans={replan_count}")
+        print(f"[PLAN] step={step+1} revision={planner.revision_count} plan={planner.current_plan} llm={llm_decided} invalid={invalid_reason or 'none'} attempts={attempts}")
         print(f"[STRATEGY] phase={strategy.phase} confidence={strategy.confidence:.2f} investigations={strategy.investigation_count}/{StrategyTracker.INVESTIGATION_LIMIT}")
         if analysis:
             print(f"[ANALYSIS] {analysis[:200]}")
@@ -720,7 +658,7 @@ def _run_episode_core(room):
         supervisor_approved = True
         if _is_unsafe(room.env, action_str):
             supervisor_approved = False
-            print(f"[SUPERVISOR] BLOCK flag for {action_str} (unsafe; preconditions not met). Not substituting.")
+            print(f"[SUPERVISOR] BLOCK flag for {action_str} (unsafe; preconditions not met).")
 
         result = room.execute_directive(target_agent, action_str, supervisor_approved)
         reward_val = result["reward"].value
