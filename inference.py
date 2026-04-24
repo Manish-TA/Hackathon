@@ -387,12 +387,12 @@ def build_planning_prompt(system_state, playbook_text, memory, planner,
 
     warnings = ""
     if memory.is_stagnating():
-        warnings += "\nWARNING: Last 3 actions had negative reward. You MUST change strategy and REVISE YOUR PLAN."
+        warnings += "\nWARNING: Last 3 actions had negative reward. The current approach is not working. You MUST switch to a DIFFERENT strategy that directly targets the ROOT CAUSE. Do NOT repeat similar actions."
     if memory.is_declining():
-        warnings += "\nWARNING: Reward trend is declining. Previous approach is not working. Pick a different feasible action."
+        warnings += "\nWARNING: Reward trend is declining. Previous actions REDUCED system health. Pick a different feasible action that improves system state and addresses the root cause upstream dependency."
     last_fail = memory.last_failed()
     if last_fail:
-        warnings += f"\nLAST ACTION FAILED: {last_fail['action']} (reward={last_fail['reward']:+.3f}). Do NOT repeat it."
+        warnings += f"\nLAST ACTION FAILED: {last_fail['action']} (reward={last_fail['reward']:+.3f}). Do NOT repeat it and do NOT choose similar actions in the same direction; switch strategy to address the ROOT CAUSE."
     if memory.failed_actions:
         warnings += f"\nBANNED (previously failed, do NOT choose): {', '.join(sorted(memory.failed_actions))}"
 
@@ -454,14 +454,18 @@ AVAILABLE ACTIONS (feasibility annotated):
 Step {step_count}/{MAX_STEPS} | Progress: {progress:.0%}
 
 RULES:
-- Your decision MUST be grounded in: (1) memory of prior actions/outcomes, (2) the current plan, (3) current system state and anomalies.
+- Your decision MUST be grounded in: (1) memory of prior actions/outcomes, (2) the current plan, (3) current system state and anomalies, (4) the ROOT CAUSE ANALYSIS above.
+- ROOT-CAUSE-FIRST: Identify the PRIMARY root cause component from the root cause analysis and anomalies. Take ONLY actions directly related to that root cause. Do NOT take actions unrelated to the root cause (e.g. DNS, auth, middleware, security) unless the anomalies or root cause analysis explicitly implicate them.
+- DEPENDENCY ORDER: detect -> diagnose -> fix ROOT CAUSE upstream dependencies FIRST -> fix the affected component -> restore dependent/downstream services LAST. Never act on a downstream symptom before the upstream root cause is fixed.
+- DOMAIN DISCIPLINE: Stay within the domain of the root cause. Do NOT switch to a different domain unless (a) the current domain's root-cause issue is already resolved, OR (b) there is a strong causal dependency from the current domain to that other domain documented in the anomalies or root cause chain.
+- REWARD-AWARE: Prefer actions that improve system state (positive reward signal). Avoid actions similar to those that previously reduced reward. If the last action failed or reward is declining, choose a DIFFERENT strategy, not a variation of the same approach.
 - Detect -> diagnose -> COMMIT -> fix -> restore. Do not re-investigate once you have enough signal.
-- Fix root causes FIRST. Dependencies: infrastructure -> database -> application.
 - NEVER repeat completed or failed actions.
 - NEVER use observability actions.
+- NEVER pick an action unrelated to the identified root cause.
 - Pick ONLY actions marked [FEASIBLE NOW]. NEVER pick actions marked [PRECONDITIONS NOT MET].
-- Your plan must be an ordered list of actions whose preconditions will be satisfied when each is reached.
-- reasoning MUST explicitly reference prior outcomes or observed state (not generic text).
+- Your plan must be an ordered list of actions whose preconditions will be satisfied when each is reached, ordered by dependency (upstream root cause first, downstream restore last).
+- reasoning MUST explicitly reference prior outcomes, observed state, and the root cause (not generic text).
 
 Return ONLY JSON:
 {{"analysis": "<situation assessment grounded in state+memory>", "plan": ["action1", "action2", ...], "next_action": "<action_name>", "target_agent": "<AgentName>", "reasoning": "<why this action next, citing memory/state>", "confidence": <number between 0.0 and 1.0 reflecting how certain you are of the root cause / fix strategy>}}"""
@@ -629,15 +633,24 @@ def _run_episode_core(room):
             chosen = decision.get("action", "") or "<none>"
             reward_note = f"last_step_reward={last_reward:+.3f}" if last_reward is not None else "no_prior_reward"
             failed_list = ", ".join(sorted(memory.failed_actions)) or "<none>"
+            feasible_now = sorted([a for a, ok in feasibility_map.items() if ok]) or []
+            feasible_text = ", ".join(feasible_now) if feasible_now else "<none available>"
+            infeasible_now = sorted([a for a, ok in feasibility_map.items() if not ok]) or []
+            infeasible_text = ", ".join(infeasible_now) if infeasible_now else "<none>"
+            unsafe_flag = "YES" if (chosen and _is_unsafe(room.env, chosen)) else "NO"
             replan_feedback = (
                 f"PREVIOUS ATTEMPT REJECTED (attempt {attempts}/{MAX_RETRIES}). "
-                f"Your chosen next_action '{chosen}' was invalid: {reason}. "
-                f"Constraint violated: must be a currently FEASIBLE action (preconditions satisfied), "
-                f"not completed, not previously failed, not an observability action, not unsafe. "
-                f"Banned/failed actions: {failed_list}. "
+                f"Your chosen next_action '{chosen}' was invalid. "
+                f"Reason: {reason}. Unsafe: {unsafe_flag}. "
+                f"Infeasible actions (preconditions NOT met - DO NOT CHOOSE): {infeasible_text}. "
+                f"Previously failed actions (BANNED): {failed_list}. "
                 f"Current reward signal: {reward_note}. "
-                f"Re-read the [FEASIBLE NOW] list and choose ONE action from it. "
-                f"Reason step by step: detect -> identify root cause -> fix root cause -> restore dependents."
+                f"VALID CHOICES RIGHT NOW [FEASIBLE]: {feasible_text}. "
+                f"Choose a DIFFERENT valid action from [FEASIBLE] that (1) satisfies preconditions, "
+                f"(2) directly addresses the ROOT CAUSE, (3) respects dependency order "
+                f"(fix upstream root cause first, then affected component, then restore downstream). "
+                f"Do not switch domains unless the current domain is resolved or a strong causal dependency justifies it. "
+                f"Correct your choice now."
             )
             print(f"[LLM-RETRY] step={step+1} attempt={attempts}/{MAX_RETRIES} rejected_action={chosen} reason={reason}")
 
@@ -668,9 +681,6 @@ def _run_episode_core(room):
             print(f"[REASONING] {reasoning[:200]}")
 
         supervisor_approved = True
-        if _is_unsafe(room.env, action_str):
-            supervisor_approved = False
-            print(f"[SUPERVISOR] BLOCK flag for {action_str} (unsafe; preconditions not met).")
 
         result = room.execute_directive(target_agent, action_str, supervisor_approved)
         reward_val = result["reward"].value
