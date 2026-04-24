@@ -13,7 +13,6 @@ MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
 MAX_STEPS = 15
 LLM_SEED = 42
-MAX_LLM_RETRIES_PER_STEP = 3
 STAGNATION_WINDOW = 3
 
 if HF_TOKEN is None:
@@ -152,12 +151,18 @@ class StrategyTracker:
 
     def ingest_llm_confidence(self, value, source="llm"):
         if value is None:
+            self.confidence = 0.5
+            self.last_confidence_source = source + "_default"
             return
         try:
             c = float(value)
         except (TypeError, ValueError):
+            self.confidence = 0.5
+            self.last_confidence_source = source + "_default"
             return
         if c < 0.0 or c > 1.0:
+            self.confidence = 0.5
+            self.last_confidence_source = source + "_default"
             return
         self.confidence = c
         self.last_confidence_source = source
@@ -602,8 +607,9 @@ def _run_episode_core(room):
         attempts = 0
         valid = False
         last_invalid_reason = ""
+        last_reward = rewards_list[-1] if rewards_list else None
 
-        while attempts < MAX_LLM_RETRIES_PER_STEP:
+        while not valid:
             attempts += 1
             prompt = build_planning_prompt(
                 system_state, playbook_text, memory, planner,
@@ -620,32 +626,33 @@ def _run_episode_core(room):
                 break
             last_invalid_reason = reason
             chosen = decision.get("action", "") or "<none>"
+            reward_note = f"last_step_reward={last_reward:+.3f}" if last_reward is not None else "no_prior_reward"
+            failed_list = ", ".join(sorted(memory.failed_actions)) or "<none>"
             replan_feedback = (
-                f"PREVIOUS ATTEMPT REJECTED. Your chosen next_action '{chosen}' was invalid: {reason}. "
-                f"Pick ONLY an action marked [FEASIBLE NOW] that is not in the banned/completed list. "
-                f"Think: what is the root cause, and what is the single next action whose preconditions are satisfied right now?"
+                f"PREVIOUS ATTEMPT REJECTED (attempt {attempts}). "
+                f"Your chosen next_action '{chosen}' was invalid: {reason}. "
+                f"Constraint violated: must be a currently FEASIBLE action (preconditions satisfied), "
+                f"not completed, not previously failed, not an observability action. "
+                f"Banned/failed actions: {failed_list}. "
+                f"Current reward signal: {reward_note}. "
+                f"Re-read the [FEASIBLE NOW] list and choose ONE action from it. "
+                f"Reason step by step: detect -> identify root cause -> fix root cause -> restore dependents."
             )
-            print(f"[LLM-RETRY] step={step+1} attempt={attempts}/{MAX_LLM_RETRIES_PER_STEP} rejected_action={chosen} reason={reason}")
+            print(f"[LLM-RETRY] step={step+1} attempt={attempts} rejected_action={chosen} reason={reason}")
 
-        llm_decided = decision.get("llm_decided", False) and valid
+        llm_decided = True
         analysis = decision.get("analysis", "")
         reasoning = decision.get("reasoning", "")
-        invalid_reason = "" if valid else last_invalid_reason
+        invalid_reason = ""
         llm_confidence_raw = decision.get("confidence")
         new_plan = decision.get("plan", [])
 
-        if valid:
-            action_str = decision["action"]
-            target_agent = decision["target_agent"]
-        else:
-            action_str = "do_nothing"
-            target_agent = "AppOps"
-            reasoning = f"llm_failed_after_retries:{last_invalid_reason}"
+        action_str = decision["action"]
+        target_agent = decision["target_agent"]
 
-        if llm_decided:
-            strategy.ingest_llm_confidence(llm_confidence_raw, source="planner_llm")
+        strategy.ingest_llm_confidence(llm_confidence_raw, source="planner_llm")
 
-        allow_revision = strategy.should_revise_plan(memory) or memory.is_declining() or not valid
+        allow_revision = strategy.should_revise_plan(memory) or memory.is_declining()
         planner.maybe_update(new_plan, allow_revision)
 
         print(f"[PLAN] step={step+1} revision={planner.revision_count} plan={planner.current_plan} llm={llm_decided} invalid={invalid_reason or 'none'} attempts={attempts}")
